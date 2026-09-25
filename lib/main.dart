@@ -1,0 +1,2618 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:ui' as ui;
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_compass/flutter_compass.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:excel/excel.dart' hide Border;
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:sqflite/sqflite.dart';
+
+void main() {
+  runApp(const CoordenadasApp());
+}
+
+class CoordenadasApp extends StatelessWidget {
+  const CoordenadasApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Coordenadas',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+        useMaterial3: true,
+      ),
+      home: const InicioRecorridosPage(),
+    );
+  }
+}
+
+class OfflineTileStore {
+  static const int zoom = 17;
+  static const String url =
+      'https://server.arcgisonline.com/ArcGIS/rest/services/'
+      'World_Imagery/MapServer/tile';
+
+  static Future<Directory> _root() async {
+    final base = await getApplicationDocumentsDirectory();
+    final directory = Directory(path.join(base.path, 'tiles_satelitales'));
+    await directory.create(recursive: true);
+    return directory;
+  }
+
+  static Future<String> tilePath(int x, int y) async {
+    final root = await _root();
+    final directory = Directory(path.join(root.path, '$zoom', '$x'));
+    await directory.create(recursive: true);
+    return path.join(directory.path, '$y.png');
+  }
+
+  static String _url(int x, int y) => '$url/$zoom/$y/$x';
+
+  static Future<int> download({
+    required LatLng center,
+    required double areaKm2,
+    void Function(int completed, int total)? onProgress,
+  }) async {
+    final sideKm = math.sqrt(areaKm2);
+    final latitudeDelta = sideKm / 111.32;
+    final longitudeDelta =
+        sideKm / (111.32 * math.cos(center.latitude * math.pi / 180));
+    final min = _tile(
+      center.latitude + latitudeDelta / 2,
+      center.longitude - longitudeDelta / 2,
+    );
+    final max = _tile(
+      center.latitude - latitudeDelta / 2,
+      center.longitude + longitudeDelta / 2,
+    );
+    final minX = math.min(min[0], max[0]);
+    final maxX = math.max(min[0], max[0]);
+    final minY = math.min(min[1], max[1]);
+    final maxY = math.max(min[1], max[1]);
+    final total = (maxX - minX + 1) * (maxY - minY + 1);
+    if (total > 2500) {
+      throw Exception('Reduce el área: supera 2500 mosaicos.');
+    }
+
+    var completed = 0;
+    var saved = 0;
+    for (var x = minX; x <= maxX; x++) {
+      for (var y = minY; y <= maxY; y++) {
+        final target = File(await tilePath(x, y));
+        if (!await target.exists()) {
+          final response = await http.get(Uri.parse(_url(x, y)));
+          if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+            await target.writeAsBytes(response.bodyBytes, flush: true);
+            saved++;
+          }
+        }
+        completed++;
+        onProgress?.call(completed, total);
+      }
+    }
+    return saved;
+  }
+
+  static List<int> _tile(double latitude, double longitude) {
+    final lat = latitude.clamp(-85.0511, 85.0511);
+    final n = math.pow(2, zoom);
+    final x = ((longitude + 180) / 360 * n).floor();
+    final y =
+        ((1 -
+                    math.log(
+                          math.tan(lat * math.pi / 180) +
+                              1 / math.cos(lat * math.pi / 180),
+                        ) /
+                        math.pi) /
+                2 *
+                n)
+            .floor();
+    return [x, y];
+  }
+}
+
+class OfflineTileProvider extends TileProvider {
+  @override
+  ImageProvider getImage(TileCoordinates coordinates, TileLayer options) {
+    final factor = coordinates.z > OfflineTileStore.zoom
+        ? math.pow(2, coordinates.z - OfflineTileStore.zoom).toInt()
+        : 1;
+    final x = coordinates.z > OfflineTileStore.zoom
+        ? coordinates.x ~/ factor
+        : coordinates.x;
+    final y = coordinates.z > OfflineTileStore.zoom
+        ? coordinates.y ~/ factor
+        : coordinates.y;
+    final localZoom = coordinates.z >= OfflineTileStore.zoom
+        ? OfflineTileStore.zoom
+        : coordinates.z;
+    final file = File(path.join(_directoryPath, '$localZoom', '$x', '$y.png'));
+    if (_directoryPath.isNotEmpty && file.existsSync()) {
+      return FileImage(file);
+    }
+    return NetworkImage(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/'
+      'World_Imagery/MapServer/tile/${coordinates.z}/'
+      '${coordinates.y}/${coordinates.x}',
+    );
+  }
+
+  static String _directoryPath = '';
+
+  static Future<void> prepare() async {
+    final directory = await OfflineTileStore._root();
+    _directoryPath = directory.path;
+  }
+}
+
+class InicioRecorridosPage extends StatefulWidget {
+  const InicioRecorridosPage({super.key});
+
+  @override
+  State<InicioRecorridosPage> createState() => _InicioRecorridosPageState();
+}
+
+class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
+  final MapController _mapController = MapController();
+  StreamSubscription<Position>? _suscripcionUbicacion;
+  StreamSubscription<CompassEvent>? _suscripcionRumbo;
+  List<Proyecto> _plantaciones = [];
+  Position? _posicion;
+  LatLng? _coordenadaSeleccionada;
+  double? _rumbo;
+  double _zoomMapa = 19;
+  double _latitudMapa = 4.7110;
+  bool _cargando = true;
+  bool _obteniendoUbicacion = false;
+  bool _descargandoZonaActiva = false;
+  bool _disposed = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(OfflineTileProvider.prepare());
+    _cargarPlantaciones();
+    _obtenerUbicacion();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    final subscription = _suscripcionUbicacion;
+    _suscripcionUbicacion = null;
+    unawaited(subscription?.cancel());
+    unawaited(_suscripcionRumbo?.cancel());
+    _suscripcionRumbo = null;
+    super.dispose();
+  }
+
+  Future<void> _cargarPlantaciones() async {
+    try {
+      final plantaciones = await PuntosDatabase.obtenerProyectos();
+      if (!mounted) return;
+      setState(() {
+        _plantaciones = plantaciones;
+        _cargando = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _cargando = false;
+        _error = 'No se pudieron cargar las plantaciones: $error';
+      });
+    }
+  }
+
+  Future<void> _obtenerUbicacion() async {
+    if (_obteniendoUbicacion) return;
+    setState(() {
+      _obteniendoUbicacion = true;
+      _error = null;
+    });
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        throw Exception('Activa el servicio de ubicación.');
+      }
+      var permiso = await Geolocator.checkPermission();
+      if (permiso == LocationPermission.denied) {
+        permiso = await Geolocator.requestPermission();
+      }
+      if (permiso == LocationPermission.denied ||
+          permiso == LocationPermission.deniedForever) {
+        throw Exception('Se necesita permiso de ubicación.');
+      }
+      final posicion = await Geolocator.getCurrentPosition();
+      if (!mounted || _disposed) return;
+      setState(() => _posicion = posicion);
+      _mapController.move(LatLng(posicion.latitude, posicion.longitude), 17);
+      _suscribirseUbicacion();
+      _suscribirseBrujula();
+    } catch (error) {
+      if (mounted && !_disposed) setState(() => _error = error.toString());
+    } finally {
+      if (mounted && !_disposed) setState(() => _obteniendoUbicacion = false);
+    }
+  }
+
+  void _suscribirseUbicacion() {
+    if (_suscripcionUbicacion != null || _disposed) return;
+    _suscripcionUbicacion =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 2,
+          ),
+        ).listen((posicion) {
+          if (!mounted || _disposed) return;
+          setState(() => _posicion = posicion);
+        });
+  }
+
+  void _suscribirseBrujula() {
+    if (_suscripcionRumbo != null || _disposed) return;
+    final eventos = FlutterCompass.events;
+    if (eventos == null) return;
+    _suscripcionRumbo = eventos.listen(_actualizarRumbo);
+  }
+
+  void _actualizarRumbo(CompassEvent evento) {
+    final rumbo = evento.heading;
+    if (!mounted || _disposed || rumbo == null) return;
+    setState(() => _rumbo = rumbo);
+  }
+
+  void _actualizarVistaMapa(MapCamera camera, bool hasGesture) {
+    if (!mounted || _disposed) return;
+    setState(() {
+      _zoomMapa = camera.zoom;
+      _latitudMapa = camera.center.latitude;
+    });
+  }
+
+  void _seleccionarCoordenada(TapPosition _, LatLng punto) {
+    if (!mounted || _disposed) return;
+    setState(() => _coordenadaSeleccionada = punto);
+  }
+
+  Future<void> _descargarZona() async {
+    final posicion = _posicion;
+    if (posicion == null || !mounted || _descargandoZonaActiva) return;
+    final area = await showDialog<double>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('Descargar zona satelital'),
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              'Se descargara un cuadrado centrado en tu ubicacion. '
+              'Hazlo antes de entrar a una zona sin senal.',
+            ),
+          ),
+          for (final km2 in [1.0, 4.0, 9.0, 16.0])
+            SimpleDialogOption(
+              onPressed: () =>
+                  Navigator.of(dialogContext, rootNavigator: true).pop(km2),
+              child: Text('${km2.toStringAsFixed(0)} km2'),
+            ),
+        ],
+      ),
+    );
+    if (!mounted || area == null) return;
+
+    _descargandoZonaActiva = true;
+    var progreso = 0;
+    var total = 1;
+    void Function(void Function())? actualizarDialogo;
+    showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      barrierDismissible: false,
+      builder: (_) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) {
+          actualizarDialogo = setDialogState;
+          return AlertDialog(
+            title: const Text('Descargando mapas'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                LinearProgressIndicator(
+                  value: total <= 1 ? null : progreso / total,
+                ),
+                const SizedBox(height: 12),
+                Text('$progreso de $total mosaicos'),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    try {
+      final saved = await OfflineTileStore.download(
+        center: LatLng(posicion.latitude, posicion.longitude),
+        areaKm2: area,
+        onProgress: (completed, count) {
+          progreso = completed;
+          total = count;
+          actualizarDialogo?.call(() {});
+        },
+      );
+      if (mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+        _mostrarAviso('$saved mosaicos guardados para uso offline.');
+      }
+    } catch (error) {
+      if (mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+        _mostrarAviso('No se pudo descargar la zona: $error');
+      }
+    } finally {
+      _descargandoZonaActiva = false;
+    }
+  }
+
+  void _mostrarAviso(String mensaje) {
+    if (!mounted || _disposed) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(mensaje)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final posicion = _posicion;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Recorridos'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            tooltip: 'Descargar zona para uso offline',
+            onPressed: _posicion == null || _descargandoZonaActiva
+                ? null
+                : _descargarZona,
+            icon: const Icon(Icons.download_for_offline),
+          ),
+          IconButton(
+            tooltip: 'Plantaciones',
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => const ProyectosPage()),
+              );
+              if (mounted) _cargarPlantaciones();
+            },
+            icon: const Icon(Icons.agriculture),
+          ),
+        ],
+      ),
+      body: _cargando
+          ? const Center(child: CircularProgressIndicator())
+          : Column(
+              children: [
+                Expanded(
+                  child: FlutterMap(
+                    mapController: _mapController,
+                    options: MapOptions(
+                      initialCenter: posicion == null
+                          ? const LatLng(4.7110, -74.0721)
+                          : LatLng(posicion.latitude, posicion.longitude),
+                      initialZoom: posicion == null ? 6 : 19,
+                      maxZoom: 24,
+                      backgroundColor: const Color(0xFF53624F),
+                      onPositionChanged: _actualizarVistaMapa,
+                      onTap: _seleccionarCoordenada,
+                    ),
+                    children: [
+                      TileLayer(
+                        urlTemplate:
+                            'https://server.arcgisonline.com/ArcGIS/rest/'
+                            'services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                        userAgentPackageName: 'com.example.coordenadas_app',
+                        maxNativeZoom: 17,
+                        tileProvider: OfflineTileProvider(),
+                      ),
+                      if (posicion != null)
+                        MarkerLayer(
+                          markers: [
+                            Marker(
+                              point: LatLng(
+                                posicion.latitude,
+                                posicion.longitude,
+                              ),
+                              width: 48,
+                              height: 48,
+                              child: _MarcadorUbicacion(
+                                rumbo: _rumbo ?? posicion.heading,
+                                precision: posicion.accuracy,
+                              ),
+                            ),
+                          ],
+                        ),
+                      if (_coordenadaSeleccionada != null)
+                        MarkerLayer(
+                          markers: [
+                            Marker(
+                              point: _coordenadaSeleccionada!,
+                              width: 42,
+                              height: 42,
+                              child: const Icon(
+                                Icons.add_location_alt,
+                                color: Colors.red,
+                                size: 36,
+                              ),
+                            ),
+                          ],
+                        ),
+                      RichAttributionWidget(
+                        attributions: [
+                          TextSourceAttribution(
+                            'Esri, Maxar, Earthstar Geographics',
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                _IndicadorVistaMapa(zoom: _zoomMapa, latitud: _latitudMapa),
+                _CoordenadasMapa(
+                  punto:
+                      _coordenadaSeleccionada ??
+                      (posicion == null
+                          ? null
+                          : LatLng(posicion.latitude, posicion.longitude)),
+                  etiqueta: _coordenadaSeleccionada == null
+                      ? 'Ubicacion actual'
+                      : 'Punto seleccionado',
+                ),
+                _IndicadorBrujula(rumbo: _rumbo ?? posicion?.heading),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: _obteniendoUbicacion
+                            ? null
+                            : _obtenerUbicacion,
+                        icon: const Icon(Icons.my_location),
+                        label: Text(
+                          _obteniendoUbicacion
+                              ? 'Obteniendo ubicación...'
+                              : 'Centrar en mi ubicación',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      FilledButton.icon(
+                        onPressed: () async {
+                          await Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) => const ProyectosPage(),
+                            ),
+                          );
+                          if (mounted) _cargarPlantaciones();
+                        },
+                        icon: const Icon(Icons.agriculture),
+                        label: Text(
+                          _plantaciones.isEmpty
+                              ? 'Crear una plantación'
+                              : 'Abrir plantaciones e iniciar recorrido',
+                        ),
+                      ),
+                      if (_error != null)
+                        Text(
+                          _error!,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+class _CargandoOperacion extends StatelessWidget {
+  const _CargandoOperacion({required this.mensaje});
+
+  final String mensaje;
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: ColoredBox(
+        color: Colors.black38,
+        child: Center(
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const CircularProgressIndicator(),
+                  const SizedBox(height: 12),
+                  Text(mensaje),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _IndicadorVistaMapa extends StatelessWidget {
+  const _IndicadorVistaMapa({required this.zoom, required this.latitud});
+
+  final double zoom;
+  final double latitud;
+
+  @override
+  Widget build(BuildContext context) {
+    final metrosPorPixel =
+        156543.03392 * math.cos(latitud * math.pi / 180) / math.pow(2, zoom);
+    final altoMapa = MediaQuery.sizeOf(context).height * 0.42;
+    final piesVista = (metrosPorPixel * altoMapa / 2 * 3.28084)
+        .clamp(1, double.infinity)
+        .round();
+    final metrosVista = (piesVista / 3.28084).round();
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Card(
+          margin: const EdgeInsets.only(top: 4, bottom: 4),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            child: Text(
+              'Zoom ${zoom.toStringAsFixed(1)} · '
+              'Vista aprox.: $metrosVista m / $piesVista pies',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CoordenadasMapa extends StatelessWidget {
+  const _CoordenadasMapa({required this.punto, required this.etiqueta});
+
+  final LatLng? punto;
+  final String etiqueta;
+
+  @override
+  Widget build(BuildContext context) {
+    if (punto == null) {
+      return const SizedBox.shrink();
+    }
+
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Card(
+        margin: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          child: Text(
+            '$etiqueta\n'
+            'Lat: ${punto!.latitude.toStringAsFixed(6)}\n'
+            'Lon: ${punto!.longitude.toStringAsFixed(6)}',
+            textAlign: TextAlign.right,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _IndicadorBrujula extends StatelessWidget {
+  const _IndicadorBrujula({required this.rumbo});
+
+  final double? rumbo;
+
+  String _direccion(double valor) {
+    const nombres = [
+      'Norte',
+      'Noreste',
+      'Este',
+      'Sureste',
+      'Sur',
+      'Suroeste',
+      'Oeste',
+      'Noroeste',
+    ];
+    final indice = ((valor + 22.5) / 45).floor() % nombres.length;
+    return nombres[indice];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final valor = rumbo != null && rumbo!.isFinite && rumbo! >= 0
+        ? rumbo!
+        : null;
+    final direccion = valor == null ? 'Sin señal' : _direccion(valor);
+    final angulo = valor == null ? 0.0 : valor * math.pi / 180;
+
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Card(
+        margin: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Transform.rotate(
+                angle: angulo,
+                child: const Icon(
+                  Icons.navigation,
+                  color: Colors.red,
+                  size: 25,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '$direccion${valor == null ? '' : ' · ${valor.toStringAsFixed(0)}°'}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MarcadorUbicacion extends StatelessWidget {
+  const _MarcadorUbicacion({required this.rumbo, required this.precision});
+
+  final double rumbo;
+  final double precision;
+
+  @override
+  Widget build(BuildContext context) {
+    final angulo = rumbo.isFinite && rumbo >= 0 ? rumbo * math.pi / 180 : 0.0;
+    final radio = precision.isFinite ? precision.clamp(8.0, 45.0) : 12.0;
+
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Container(
+          width: radio * 2,
+          height: radio * 2,
+          decoration: BoxDecoration(
+            color: Colors.blue.withValues(alpha: 0.16),
+            shape: BoxShape.circle,
+          ),
+        ),
+        Transform.rotate(
+          angle: angulo,
+          child: CustomPaint(
+            size: const Size(44, 44),
+            painter: _FlechaRumboPainter(),
+          ),
+        ),
+        Container(
+          width: 16,
+          height: 16,
+          decoration: BoxDecoration(
+            color: Colors.blue,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 3),
+            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 3)],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _FlechaRumboPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final centro = Offset(size.width / 2, size.height / 2);
+    final ruta = ui.Path()
+      ..moveTo(centro.dx, 2)
+      ..lineTo(centro.dx - 9, centro.dy + 11)
+      ..lineTo(centro.dx, centro.dy + 7)
+      ..lineTo(centro.dx + 9, centro.dy + 11)
+      ..close();
+    canvas.drawPath(ruta, Paint()..color = Colors.blue.withValues(alpha: 0.85));
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class Proyecto {
+  const Proyecto({
+    required this.id,
+    required this.nombre,
+    required this.descripcion,
+    this.responsable,
+    this.estado = 'Planificado',
+    this.latitud,
+    this.longitud,
+    this.variedadPalma,
+    this.cantidadPalmas,
+    this.fechaInicio,
+    this.fechaFin,
+    this.fotoPath,
+  });
+
+  final int id;
+  final String nombre;
+  final String descripcion;
+  final String? responsable;
+  final String estado;
+  final double? latitud;
+  final double? longitud;
+  final String? variedadPalma;
+  final int? cantidadPalmas;
+  final String? fechaInicio;
+  final String? fechaFin;
+  final String? fotoPath;
+}
+
+enum EstadoRecorrido { detenido, activo, pausado, finalizado }
+
+class Recorrido {
+  const Recorrido({
+    required this.id,
+    required this.proyectoId,
+    required this.nombre,
+    required this.estado,
+    required this.inicio,
+    this.fin,
+  });
+
+  final int id;
+  final int proyectoId;
+  final String nombre;
+  final EstadoRecorrido estado;
+  final DateTime inicio;
+  final DateTime? fin;
+}
+
+class PuntosDatabase {
+  static Database? _database;
+
+  static Future<Database> get database async {
+    final database = _database;
+    if (database != null) return database;
+
+    final databasesPath = await getDatabasesPath();
+    final databasePath = path.join(databasesPath, 'coordenadas.db');
+    _database = await openDatabase(
+      databasePath,
+      version: 13,
+      onCreate: (database, version) async {
+        await database.execute('''
+          CREATE TABLE puntos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            latitud REAL NOT NULL,
+            longitud REAL NOT NULL,
+            altitud REAL NOT NULL,
+            precision REAL NOT NULL,
+            fecha TEXT NOT NULL,
+            origen TEXT NOT NULL DEFAULT 'GPS'
+            ,cantidad_palmas INTEGER
+          )
+        ''');
+        await _crearTablasOrganizacion(database);
+        await _crearTablaProyectos(database);
+        await _crearProyectoPredeterminado(database);
+        await _crearTablasRecorridos(database);
+      },
+      onUpgrade: (database, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await _crearTablasOrganizacion(database);
+        }
+        if (oldVersion < 3) {
+          await database.execute(
+            'ALTER TABLE segmentos ADD COLUMN vertices TEXT NOT NULL DEFAULT \'[]\'',
+          );
+        }
+        if (oldVersion < 4) {
+          await _crearTablaProyectos(database);
+          await database.execute(
+            'ALTER TABLE capas ADD COLUMN proyecto_id INTEGER NOT NULL DEFAULT 1',
+          );
+          await _crearProyectoPredeterminado(database);
+        }
+        if (oldVersion < 5) {
+          await _agregarCamposAgronomicos(database);
+        }
+        if (oldVersion < 6) {
+          await database.execute(
+            "ALTER TABLE puntos ADD COLUMN origen TEXT NOT NULL DEFAULT 'GPS'",
+          );
+        }
+        if (oldVersion < 7) {
+          await _agregarCamposProyecto(database);
+        }
+        if (oldVersion < 8) {
+          await _crearTablasRecorridos(database);
+        }
+        if (oldVersion < 9) {
+          await database.execute(
+            'ALTER TABLE recorridos ADD COLUMN proyecto_id INTEGER NOT NULL DEFAULT 1',
+          );
+        }
+        if (oldVersion < 10) {
+          await _agregarCamposPuntosRecorrido(database);
+        }
+        if (oldVersion < 11) {
+          await _agregarCamposPlantacion(database);
+        }
+        if (oldVersion < 12) {
+          await _agregarNumeracionRegistros(database);
+        }
+        if (oldVersion < 13) {
+          await database.execute(
+            'ALTER TABLE puntos ADD COLUMN cantidad_palmas INTEGER',
+          );
+        }
+      },
+    );
+    return _database!;
+  }
+
+  static Future<void> _crearTablasOrganizacion(Database database) async {
+    await database.execute('''
+      CREATE TABLE IF NOT EXISTS capas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        proyecto_id INTEGER NOT NULL DEFAULT 1,
+        nombre TEXT NOT NULL,
+        descripcion TEXT NOT NULL DEFAULT ''
+      )
+    ''');
+    await database.execute('''
+      CREATE TABLE IF NOT EXISTS segmentos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        capa_id INTEGER NOT NULL,
+        nombre TEXT NOT NULL,
+        descripcion TEXT NOT NULL DEFAULT '',
+        vertices TEXT NOT NULL DEFAULT '[]',
+        area_m2 REAL,
+        perimetro_m REAL,
+        cantidad_palmas INTEGER,
+        variedad TEXT,
+        estado TEXT,
+        ph_suelo REAL,
+        FOREIGN KEY (capa_id) REFERENCES capas (id) ON DELETE CASCADE
+      )
+    ''');
+  }
+
+  static Future<void> _agregarCamposAgronomicos(Database database) async {
+    for (final columna in [
+      'area_m2 REAL',
+      'perimetro_m REAL',
+      'cantidad_palmas INTEGER',
+      'variedad TEXT',
+      'estado TEXT',
+      'ph_suelo REAL',
+    ]) {
+      await database.execute('ALTER TABLE segmentos ADD COLUMN $columna');
+    }
+  }
+
+  static Future<void> _crearTablaProyectos(Database database) async {
+    await database.execute('''
+      CREATE TABLE IF NOT EXISTS proyectos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT NOT NULL,
+        descripcion TEXT NOT NULL DEFAULT '',
+        responsable TEXT,
+        estado TEXT NOT NULL DEFAULT 'Planificado',
+        latitud REAL,
+        longitud REAL,
+        fecha_inicio TEXT,
+        fecha_fin TEXT,
+        foto_path TEXT,
+        variedad_palma TEXT,
+        cantidad_palmas INTEGER
+      )
+    ''');
+  }
+
+  static Future<void> _agregarCamposProyecto(Database database) async {
+    for (final columna in [
+      'responsable TEXT',
+      "estado TEXT NOT NULL DEFAULT 'Planificado'",
+      'latitud REAL',
+      'longitud REAL',
+      'fecha_inicio TEXT',
+      'fecha_fin TEXT',
+      'foto_path TEXT',
+    ]) {
+      await database.execute('ALTER TABLE proyectos ADD COLUMN $columna');
+    }
+  }
+
+  static Future<void> _agregarCamposPlantacion(Database database) async {
+    await database.execute(
+      'ALTER TABLE proyectos ADD COLUMN variedad_palma TEXT',
+    );
+    await database.execute(
+      'ALTER TABLE proyectos ADD COLUMN cantidad_palmas INTEGER',
+    );
+  }
+
+  static Future<void> _crearProyectoPredeterminado(Database database) async {
+    final proyectos = await database.query('proyectos', limit: 1);
+    if (proyectos.isEmpty) {
+      await database.insert('proyectos', {
+        'nombre': 'Plantación inicial',
+        'descripcion': 'Plantación creada automáticamente',
+      });
+    }
+  }
+
+  static Future<List<Proyecto>> obtenerProyectos() async {
+    final database = await PuntosDatabase.database;
+    final rows = await database.query('proyectos', orderBy: 'id DESC');
+    return rows
+        .map(
+          (row) => Proyecto(
+            id: row['id']! as int,
+            nombre: row['nombre']! as String,
+            descripcion: row['descripcion']! as String,
+            responsable: row['responsable'] as String?,
+            estado: (row['estado'] as String?) ?? 'Planificado',
+            latitud: (row['latitud'] as num?)?.toDouble(),
+            longitud: (row['longitud'] as num?)?.toDouble(),
+            variedadPalma: row['variedad_palma'] as String?,
+            cantidadPalmas: row['cantidad_palmas'] as int?,
+            fechaInicio: row['fecha_inicio'] as String?,
+            fechaFin: row['fecha_fin'] as String?,
+            fotoPath: row['foto_path'] as String?,
+          ),
+        )
+        .toList();
+  }
+
+  static Future<int> guardarProyecto({
+    required String nombre,
+    required String descripcion,
+    String? responsable,
+    required String estado,
+    double? latitud,
+    double? longitud,
+    String? variedadPalma,
+    int? cantidadPalmas,
+    String? fechaInicio,
+    String? fechaFin,
+    String? fotoPath,
+  }) async {
+    final database = await PuntosDatabase.database;
+    return database.insert('proyectos', {
+      'nombre': nombre,
+      'descripcion': descripcion,
+      'responsable': responsable,
+      'estado': estado,
+      'latitud': latitud,
+      'longitud': longitud,
+      'variedad_palma': variedadPalma,
+      'cantidad_palmas': cantidadPalmas,
+      'fecha_inicio': fechaInicio,
+      'fecha_fin': fechaFin,
+      'foto_path': fotoPath,
+    });
+  }
+
+  static Future<void> actualizarDatosPlantacion({
+    required int id,
+    required int? cantidadPalmas,
+  }) async {
+    final database = await PuntosDatabase.database;
+    await database.update(
+      'proyectos',
+      {'cantidad_palmas': cantidadPalmas},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  static Future<void> actualizarUbicacionPlantacion({
+    required int id,
+    required double latitud,
+    required double longitud,
+  }) async {
+    final database = await PuntosDatabase.database;
+    await database.update(
+      'proyectos',
+      {'latitud': latitud, 'longitud': longitud},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  static Future<void> _crearTablasRecorridos(Database database) async {
+    await database.execute('''
+    CREATE TABLE IF NOT EXISTS recorridos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      proyecto_id INTEGER NOT NULL,
+      nombre TEXT NOT NULL,
+      estado TEXT NOT NULL,
+      inicio TEXT NOT NULL,
+      fin TEXT
+    )
+  ''');
+    await database.execute('''
+    CREATE TABLE IF NOT EXISTS recorrido_puntos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recorrido_id INTEGER NOT NULL,
+      latitud REAL NOT NULL,
+      longitud REAL NOT NULL,
+      altitud REAL NOT NULL,
+      precision REAL NOT NULL,
+      fecha TEXT NOT NULL,
+      racimos_verdes INTEGER,
+      racimos_pintones INTEGER,
+      inflorescencias INTEGER,
+      foto_path TEXT,
+      numero_registro INTEGER,
+      FOREIGN KEY (recorrido_id) REFERENCES recorridos (id) ON DELETE CASCADE
+    )
+  ''');
+  }
+
+  static Future<void> _agregarCamposPuntosRecorrido(Database database) async {
+    for (final columna in [
+      'racimos_verdes INTEGER',
+      'racimos_pintones INTEGER',
+      'inflorescencias INTEGER',
+      'foto_path TEXT',
+    ]) {
+      await database.execute(
+        'ALTER TABLE recorrido_puntos ADD COLUMN $columna',
+      );
+    }
+  }
+
+  static Future<void> _agregarNumeracionRegistros(Database database) async {
+    await database.execute(
+      'ALTER TABLE recorrido_puntos ADD COLUMN numero_registro INTEGER',
+    );
+    final filas = await database.query(
+      'recorrido_puntos',
+      where:
+          '(racimos_verdes IS NOT NULL OR racimos_pintones IS NOT NULL OR '
+          'inflorescencias IS NOT NULL OR foto_path IS NOT NULL)',
+      orderBy: 'recorrido_id, fecha, id',
+    );
+    var recorridoActual = -1;
+    var numero = 0;
+    for (final fila in filas) {
+      final recorridoId = fila['recorrido_id']! as int;
+      if (recorridoId != recorridoActual) {
+        recorridoActual = recorridoId;
+        numero = 0;
+      }
+      numero++;
+      await database.update(
+        'recorrido_puntos',
+        {'numero_registro': numero},
+        where: 'id = ?',
+        whereArgs: [fila['id']],
+      );
+    }
+  }
+
+  static Future<int> crearRecorrido({
+    required int proyectoId,
+    required String nombre,
+  }) async {
+    final database = await PuntosDatabase.database;
+    return database.insert('recorridos', {
+      'proyecto_id': proyectoId,
+      'nombre': nombre,
+      'estado': 'activo',
+      'inicio': DateTime.now().toIso8601String(),
+    });
+  }
+
+  static Future<void> actualizarEstadoRecorrido(
+    int id,
+    EstadoRecorrido estado, {
+    DateTime? fin,
+  }) async {
+    final database = await PuntosDatabase.database;
+    await database.update(
+      'recorridos',
+      {'estado': estado.name, if (fin != null) 'fin': fin.toIso8601String()},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  static Future<void> guardarPuntoRecorrido({
+    required int recorridoId,
+    required Position posicion,
+  }) async {
+    final database = await PuntosDatabase.database;
+    await database.insert('recorrido_puntos', {
+      'recorrido_id': recorridoId,
+      'latitud': posicion.latitude,
+      'longitud': posicion.longitude,
+      'altitud': posicion.altitude,
+      'precision': posicion.accuracy,
+      'fecha': posicion.timestamp.toIso8601String(),
+    });
+  }
+
+  static Future<void> guardarRegistroRecorrido({
+    required int recorridoId,
+    required Position posicion,
+    int? racimosVerdes,
+    int? racimosPintones,
+    int? inflorescencias,
+    String? fotoPath,
+  }) async {
+    final database = await PuntosDatabase.database;
+    final ultimoRegistro = await database.rawQuery(
+      'SELECT COALESCE(MAX(numero_registro), 0) AS numero '
+      'FROM recorrido_puntos WHERE recorrido_id = ?',
+      [recorridoId],
+    );
+    final numeroRegistro = (ultimoRegistro.first['numero']! as num).toInt() + 1;
+    await database.insert('recorrido_puntos', {
+      'recorrido_id': recorridoId,
+      'latitud': posicion.latitude,
+      'longitud': posicion.longitude,
+      'altitud': posicion.altitude,
+      'precision': posicion.accuracy,
+      'fecha': posicion.timestamp.toIso8601String(),
+      'racimos_verdes': racimosVerdes,
+      'racimos_pintones': racimosPintones,
+      'inflorescencias': inflorescencias,
+      'foto_path': fotoPath,
+      'numero_registro': numeroRegistro,
+    });
+  }
+
+  static Future<List<LatLng>> obtenerPuntosRecorrido(int id) async {
+    final database = await PuntosDatabase.database;
+    final filas = await database.query(
+      'recorrido_puntos',
+      where: 'recorrido_id = ?',
+      whereArgs: [id],
+      orderBy: 'fecha',
+    );
+    return filas
+        .map(
+          (fila) => LatLng(
+            (fila['latitud']! as num).toDouble(),
+            (fila['longitud']! as num).toDouble(),
+          ),
+        )
+        .toList();
+  }
+
+  static Future<int> contarRegistrosRecorrido(int id) async {
+    final database = await PuntosDatabase.database;
+    final resultado = await database.rawQuery(
+      'SELECT COUNT(*) AS total FROM recorrido_puntos '
+      'WHERE recorrido_id = ? AND numero_registro IS NOT NULL',
+      [id],
+    );
+    return (resultado.first['total']! as int);
+  }
+
+  static Future<List<Map<String, Object?>>> obtenerRegistrosRecorrido(
+    int id,
+  ) async {
+    final database = await PuntosDatabase.database;
+    return database.query(
+      'recorrido_puntos',
+      where:
+          'recorrido_id = ? AND '
+          'numero_registro IS NOT NULL',
+      whereArgs: [id],
+      orderBy: 'fecha',
+    );
+  }
+
+  static Future<List<Recorrido>> obtenerRecorridos(int proyectoId) async {
+    final database = await PuntosDatabase.database;
+    final filas = await database.query(
+      'recorridos',
+      where: 'proyecto_id = ?',
+      whereArgs: [proyectoId],
+      orderBy: 'id DESC',
+    );
+    return filas
+        .map(
+          (fila) => Recorrido(
+            id: fila['id']! as int,
+            proyectoId: fila['proyecto_id']! as int,
+            nombre: fila['nombre']! as String,
+            estado: EstadoRecorrido.values.firstWhere(
+              (item) => item.name == fila['estado'],
+              orElse: () => EstadoRecorrido.finalizado,
+            ),
+            inicio: DateTime.parse(fila['inicio']! as String),
+            fin: fila['fin'] == null
+                ? null
+                : DateTime.parse(fila['fin']! as String),
+          ),
+        )
+        .toList();
+  }
+}
+
+class ExportadorDatos {
+  static Future<void> compartirRecorridoExcel(int recorridoId) async {
+    final database = await PuntosDatabase.database;
+    final recorrido = (await database.query(
+      'recorridos',
+      where: 'id = ?',
+      whereArgs: [recorridoId],
+      limit: 1,
+    )).first;
+    final plantacion = (await database.query(
+      'proyectos',
+      where: 'id = ?',
+      whereArgs: [recorrido['proyecto_id']],
+      limit: 1,
+    )).first;
+    final filas = await database.query(
+      'recorrido_puntos',
+      where: 'recorrido_id = ? AND numero_registro IS NOT NULL',
+      whereArgs: [recorridoId],
+      orderBy: 'numero_registro, fecha',
+    );
+    final libro = Excel.createExcel();
+    final hoja = libro['Recorrido'];
+    hoja.appendRow([
+      TextCellValue('N° registro'),
+      TextCellValue('ID del registro'),
+      TextCellValue('Plantación'),
+      TextCellValue('Recorrido'),
+      TextCellValue('Latitud'),
+      TextCellValue('Longitud'),
+      TextCellValue('Altitud'),
+      TextCellValue('Precisión'),
+      TextCellValue('Fecha'),
+      TextCellValue('Racimos verdes'),
+      TextCellValue('Racimos pintones'),
+      TextCellValue('Inflorescencias'),
+    ]);
+    for (final fila in filas) {
+      hoja.appendRow([
+        IntCellValue((fila['numero_registro'] as int?) ?? 0),
+        IntCellValue((fila['id'] as int?) ?? 0),
+        TextCellValue('${plantacion['nombre']}'),
+        TextCellValue('${recorrido['nombre']}'),
+        DoubleCellValue((fila['latitud']! as num).toDouble()),
+        DoubleCellValue((fila['longitud']! as num).toDouble()),
+        DoubleCellValue((fila['altitud']! as num).toDouble()),
+        DoubleCellValue((fila['precision']! as num).toDouble()),
+        TextCellValue('${fila['fecha']}'),
+        IntCellValue((fila['racimos_verdes'] as int?) ?? 0),
+        IntCellValue((fila['racimos_pintones'] as int?) ?? 0),
+        IntCellValue((fila['inflorescencias'] as int?) ?? 0),
+      ]);
+    }
+    final bytes = libro.encode();
+    if (bytes == null) {
+      throw StateError('No se pudo generar el archivo Excel.');
+    }
+    await _compartir(
+      Uint8List.fromList(bytes),
+      'recorrido_$recorridoId.xlsx',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+  }
+
+  static Future<void> compartirRecorridoKml(int recorridoId) async {
+    final database = await PuntosDatabase.database;
+    final recorrido = (await database.query(
+      'recorridos',
+      where: 'id = ?',
+      whereArgs: [recorridoId],
+      limit: 1,
+    )).first;
+    final filas = await database.query(
+      'recorrido_puntos',
+      where: 'recorrido_id = ?',
+      whereArgs: [recorridoId],
+      orderBy: 'fecha',
+    );
+    final coordenadas = filas
+        .map(
+          (fila) => '${fila['longitud']},${fila['latitud']},${fila['altitud']}',
+        )
+        .join(' ');
+    final registros = filas.where(
+      (fila) =>
+          fila['racimos_verdes'] != null ||
+          fila['racimos_pintones'] != null ||
+          fila['inflorescencias'] != null,
+    );
+    final marcas = registros
+        .map(
+          (fila) =>
+              '''
+    <Placemark>
+      <name>Registro ${_xml(fila['numero_registro'])}</name>
+      <description><![CDATA[
+        Registro: ${_xml(fila['numero_registro'])}<br/>
+        Racimos verdes: ${_xml(fila['racimos_verdes'] ?? 0)}<br/>
+        Racimos pintones: ${_xml(fila['racimos_pintones'] ?? 0)}<br/>
+        Inflorescencias: ${_xml(fila['inflorescencias'] ?? 0)}<br/>
+        Fecha: ${_xml(fila['fecha'])}
+      ]]></description>
+      <Point><coordinates>${fila['longitud']},${fila['latitud']},${fila['altitud']}</coordinates></Point>
+    </Placemark>
+  ''',
+        )
+        .join();
+    final kml =
+        '''
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>${_xml(recorrido['nombre'])}</name>
+    <Placemark>
+      <name>Ruta</name>
+      <LineString><tessellate>1</tessellate><coordinates>$coordenadas</coordinates></LineString>
+    </Placemark>
+    $marcas
+  </Document>
+</kml>
+''';
+    await _compartir(
+      Uint8List.fromList(utf8.encode(kml)),
+      'recorrido_$recorridoId.kml',
+      'application/vnd.google-earth.kml+xml',
+    );
+  }
+
+  static String _xml(Object? value) => '${value ?? ''}'
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&apos;');
+
+  static Future<void> _compartir(
+    Uint8List bytes,
+    String nombre,
+    String tipo,
+  ) async {
+    await SharePlus.instance.share(
+      ShareParams(
+        files: [XFile.fromData(bytes, name: nombre, mimeType: tipo)],
+        subject: nombre,
+        text: 'Exportación de coordenadas',
+      ),
+    );
+  }
+}
+
+class ProyectosPage extends StatefulWidget {
+  const ProyectosPage({super.key});
+
+  @override
+  State<ProyectosPage> createState() => _ProyectosPageState();
+}
+
+class _ProyectosPageState extends State<ProyectosPage> {
+  List<Proyecto> _proyectos = [];
+  final Map<int, List<Recorrido>> _recorridosPorPlantacion = {};
+  bool _cargando = true;
+  bool _creando = false;
+  bool _abriendoRecorrido = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _cargarProyectos();
+  }
+
+  Future<void> _cargarProyectos() async {
+    if (!_esDispositivoMovil) {
+      setState(() {
+        _cargando = false;
+        _error = 'Los proyectos se guardan localmente en Android.';
+      });
+      return;
+    }
+    try {
+      final proyectos = await PuntosDatabase.obtenerProyectos();
+      if (!mounted) return;
+      final recorridos = <int, List<Recorrido>>{};
+      for (final proyecto in proyectos) {
+        recorridos[proyecto.id] = await PuntosDatabase.obtenerRecorridos(
+          proyecto.id,
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _proyectos = proyectos;
+        _recorridosPorPlantacion
+          ..clear()
+          ..addAll(recorridos);
+        _cargando = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _cargando = false;
+        _error = 'No se pudieron cargar los proyectos: $error';
+      });
+    }
+  }
+
+  bool get _esDispositivoMovil =>
+      defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS;
+
+  Future<void> _crearProyecto() async {
+    if (_creando || !mounted) return;
+    setState(() => _creando = true);
+    try {
+      final datos = await _pedirDatosProyecto();
+      if (datos == null || !_esDispositivoMovil || !mounted) return;
+      await PuntosDatabase.guardarProyecto(
+        nombre: datos.nombre,
+        descripcion: '',
+        estado: 'Planificado',
+        cantidadPalmas: datos.cantidadPalmas,
+      );
+      await _cargarProyectos();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('No se pudo guardar la plantación: $error')),
+      );
+    } finally {
+      if (mounted) setState(() => _creando = false);
+    }
+  }
+
+  Future<void> _abrirRecorrido(Proyecto proyecto) async {
+    if (_abriendoRecorrido || !mounted) return;
+    setState(() => _abriendoRecorrido = true);
+    try {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => RecorridosPage(proyecto: proyecto),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _abriendoRecorrido = false);
+    }
+  }
+
+  Future<void> _editarDatosPlantacion(Proyecto proyecto) async {
+    var cantidadTexto = proyecto.cantidadPalmas?.toString() ?? '';
+    final cantidad = await showDialog<int?>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('Editar ${proyecto.nombre}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextFormField(
+              initialValue: cantidadTexto,
+              keyboardType: TextInputType.number,
+              onChanged: (value) => cantidadTexto = value,
+              decoration: const InputDecoration(
+                labelText: 'Cantidad de palmas',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext, rootNavigator: true).pop(),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final valor = int.tryParse(cantidadTexto.trim());
+              if (valor == null || valor < 0) return;
+              Navigator.of(dialogContext, rootNavigator: true).pop(valor);
+            },
+            child: const Text('Guardar'),
+          ),
+        ],
+      ),
+    );
+    if (cantidad != null && mounted) {
+      try {
+        await PuntosDatabase.actualizarDatosPlantacion(
+          id: proyecto.id,
+          cantidadPalmas: cantidad,
+        );
+        await _cargarProyectos();
+      } catch (error) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('No se pudo actualizar la plantación: $error'),
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  String _estadoTextoRecorrido(EstadoRecorrido estado) {
+    switch (estado) {
+      case EstadoRecorrido.activo:
+        return 'Activo';
+      case EstadoRecorrido.pausado:
+        return 'Pausado';
+      case EstadoRecorrido.finalizado:
+        return 'Finalizado';
+      case EstadoRecorrido.detenido:
+        return 'Detenido';
+    }
+  }
+
+  Future<({String nombre, int cantidadPalmas})?> _pedirDatosProyecto() async {
+    if (!mounted) return null;
+    var nombre = '';
+    var cantidadTexto = '';
+    return showDialog<({String nombre, int cantidadPalmas})>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, dialogSetState) => AlertDialog(
+          title: const Text('Nueva plantación'),
+          content: SizedBox(
+            width: 420,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextFormField(
+                    autofocus: true,
+                    onChanged: (value) => nombre = value,
+                    decoration: const InputDecoration(
+                      labelText: 'Nombre *',
+                      hintText: 'Ej. Hacienda La Esperanza',
+                    ),
+                  ),
+                  TextFormField(
+                    keyboardType: TextInputType.number,
+                    onChanged: (value) => cantidadTexto = value,
+                    decoration: const InputDecoration(
+                      labelText: 'Cantidad de palmas *',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext, rootNavigator: true).pop(),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final nombreFinal = nombre.trim();
+                if (nombreFinal.isEmpty) {
+                  return;
+                }
+                final cantidad = int.tryParse(cantidadTexto.trim());
+                if (cantidad == null || cantidad < 0) {
+                  return;
+                }
+                Navigator.of(
+                  dialogContext,
+                  rootNavigator: true,
+                ).pop((nombre: nombreFinal, cantidadPalmas: cantidad));
+              },
+              child: const Text('Guardar'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Plantaciones'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            tooltip: 'Nueva plantación',
+            onPressed: _esDispositivoMovil && !_creando ? _crearProyecto : null,
+            icon: const Icon(Icons.create_new_folder),
+          ),
+        ],
+      ),
+      body: _cargando
+          ? const Center(child: CircularProgressIndicator())
+          : _error != null
+          ? Center(child: Text(_error!, textAlign: TextAlign.center))
+          : _proyectos.isEmpty
+          ? Center(
+              child: FilledButton.icon(
+                onPressed: _creando ? null : _crearProyecto,
+                icon: const Icon(Icons.add),
+                label: const Text('Crear primer proyecto'),
+              ),
+            )
+          : ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: _proyectos.length,
+              itemBuilder: (context, index) {
+                final proyecto = _proyectos[index];
+                final recorridos = _recorridosPorPlantacion[proyecto.id] ?? [];
+                return Card(
+                  child: ExpansionTile(
+                    initiallyExpanded: true,
+                    leading: const Icon(Icons.agriculture),
+                    title: Text(proyecto.nombre),
+                    subtitle: Text(
+                      [
+                        if (proyecto.cantidadPalmas != null)
+                          'Palmas: ${proyecto.cantidadPalmas}',
+                        if (proyecto.latitud != null &&
+                            proyecto.longitud != null)
+                          'Ubicación generada',
+                      ].join(' · '),
+                    ),
+                    trailing: IconButton(
+                      tooltip: 'Editar cantidad de palmas',
+                      onPressed: () => _editarDatosPlantacion(proyecto),
+                      icon: const Icon(Icons.edit),
+                    ),
+                    children: [
+                      if (recorridos.isEmpty)
+                        const ListTile(
+                          dense: true,
+                          leading: Icon(Icons.route_outlined),
+                          title: Text('Sin recorridos'),
+                          subtitle: Text(
+                            'Abre la plantación para iniciar el primero.',
+                          ),
+                        )
+                      else
+                        ...recorridos.map(
+                          (recorrido) => ListTile(
+                            dense: true,
+                            leading: Icon(
+                              recorrido.estado == EstadoRecorrido.activo
+                                  ? Icons.gps_fixed
+                                  : Icons.route,
+                              color: recorrido.estado == EstadoRecorrido.activo
+                                  ? Colors.green
+                                  : null,
+                            ),
+                            title: Text(recorrido.nombre),
+                            subtitle: Text(
+                              'Estado: ${_estadoTextoRecorrido(recorrido.estado)}',
+                            ),
+                            onTap: _abriendoRecorrido
+                                ? null
+                                : () => _abrirRecorrido(proyecto),
+                          ),
+                        ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                        child: SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            onPressed: _abriendoRecorrido
+                                ? null
+                                : () => _abrirRecorrido(proyecto),
+                            icon: const Icon(Icons.route),
+                            label: Text(
+                              recorridos.isEmpty
+                                  ? 'Iniciar recorrido'
+                                  : 'Abrir recorridos',
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+      floatingActionButton: _proyectos.isEmpty || !_esDispositivoMovil
+          ? null
+          : FloatingActionButton.extended(
+              onPressed: _creando ? null : _crearProyecto,
+              icon: const Icon(Icons.add),
+              label: const Text('Nueva plantación'),
+            ),
+    );
+  }
+}
+
+class RecorridosPage extends StatefulWidget {
+  const RecorridosPage({required this.proyecto, super.key});
+
+  final Proyecto proyecto;
+
+  @override
+  State<RecorridosPage> createState() => _RecorridosPageState();
+}
+
+class _RecorridosPageState extends State<RecorridosPage>
+    with WidgetsBindingObserver {
+  final MapController _mapController = MapController();
+  StreamSubscription<Position>? _suscripcion;
+  StreamSubscription<CompassEvent>? _suscripcionRumbo;
+  List<Recorrido> _recorridos = [];
+  List<LatLng> _ruta = [];
+  List<Map<String, Object?>> _puntosMuestreo = [];
+  Recorrido? _actual;
+  Position? _ultimaPosicion;
+  LatLng? _coordenadaSeleccionada;
+  double? _rumbo;
+  double _zoomMapa = 19;
+  double _latitudMapa = 4.7110;
+  int _registrosMuestreo = 0;
+  bool _cargando = true;
+  bool _iniciandoRecorrido = false;
+  bool _registrandoMuestreo = false;
+  bool _disposed = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(OfflineTileProvider.prepare());
+    WidgetsBinding.instance.addObserver(this);
+    _cargarRecorridos();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
+    final subscription = _suscripcion;
+    _suscripcion = null;
+    unawaited(subscription?.cancel());
+    unawaited(_suscripcionRumbo?.cancel());
+    _suscripcionRumbo = null;
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted && !_disposed) {
+      _reanudarRecorridoAlVolver();
+    }
+  }
+
+  Future<void> _reanudarRecorridoAlVolver() async {
+    await _cargarRecorridos();
+    final recorrido = _actual;
+    if (!mounted ||
+        _disposed ||
+        recorrido == null ||
+        recorrido.estado != EstadoRecorrido.activo ||
+        _suscripcion != null) {
+      return;
+    }
+    try {
+      if (await _prepararUbicacion()) {
+        _suscribirUbicacion();
+      }
+    } catch (error) {
+      if (mounted) {
+        _mostrarAviso('No se pudo reanudar el GPS: $error');
+      }
+    }
+  }
+
+  Future<void> _cargarRecorridos() async {
+    if (defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS) {
+      if (!mounted) return;
+      setState(() {
+        _cargando = false;
+        _error = 'Los recorridos se guardan localmente en Android.';
+      });
+      return;
+    }
+    try {
+      final recorridos = await PuntosDatabase.obtenerRecorridos(
+        widget.proyecto.id,
+      );
+      if (!mounted) return;
+      setState(() {
+        _recorridos = recorridos;
+        _actual = recorridos.firstWhere(
+          (item) =>
+              item.estado == EstadoRecorrido.activo ||
+              item.estado == EstadoRecorrido.pausado,
+          orElse: () => recorridos.isEmpty
+              ? Recorrido(
+                  id: -1,
+                  proyectoId: widget.proyecto.id,
+                  nombre: '',
+                  estado: EstadoRecorrido.detenido,
+                  inicio: DateTime(0),
+                )
+              : recorridos.first,
+        );
+        if (_actual?.id == -1) _actual = null;
+        _cargando = false;
+      });
+      if (_actual != null) {
+        _ruta = await PuntosDatabase.obtenerPuntosRecorrido(_actual!.id);
+        _puntosMuestreo = await PuntosDatabase.obtenerRegistrosRecorrido(
+          _actual!.id,
+        );
+        _registrosMuestreo = await PuntosDatabase.contarRegistrosRecorrido(
+          _actual!.id,
+        );
+        if (_ruta.isNotEmpty) {
+          final ultima = _ruta.last;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && !_disposed) {
+              _mapController.move(ultima, 19);
+            }
+          });
+        }
+        if (mounted) setState(() {});
+        if (!_disposed &&
+            !_iniciandoRecorrido &&
+            _actual!.estado == EstadoRecorrido.activo &&
+            _suscripcion == null) {
+          _suscribirUbicacion();
+        }
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _cargando = false;
+        _error = 'No se pudieron cargar los recorridos: $error';
+      });
+    }
+  }
+
+  Future<bool> _prepararUbicacion() async {
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      if (!mounted || _disposed) return false;
+      _mostrarAviso('Activa el servicio de ubicación.');
+      return false;
+    }
+    var permiso = await Geolocator.checkPermission();
+    if (permiso == LocationPermission.denied) {
+      permiso = await Geolocator.requestPermission();
+    }
+    if (!mounted || _disposed) return false;
+    if (permiso == LocationPermission.denied ||
+        permiso == LocationPermission.deniedForever) {
+      _mostrarAviso('Se necesita permiso de ubicación para recorrer.');
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _iniciarRecorrido() async {
+    if (_iniciandoRecorrido || !mounted || _disposed) return;
+    setState(() => _iniciandoRecorrido = true);
+    try {
+      final nombre = await _pedirNombreRecorrido();
+      if (nombre == null || !mounted || _disposed) return;
+      if (!await _prepararUbicacion()) return;
+      if (!mounted || _disposed) return;
+      final id = await PuntosDatabase.crearRecorrido(
+        proyectoId: widget.proyecto.id,
+        nombre: nombre,
+      );
+      final recorridos = await PuntosDatabase.obtenerRecorridos(
+        widget.proyecto.id,
+      );
+      _actual = recorridos.firstWhere((item) => item.id == id);
+      _ruta = [];
+      if (mounted) setState(() => _recorridos = recorridos);
+      final posicionInicial = await Geolocator.getCurrentPosition();
+      if (!mounted || _disposed) return;
+      await PuntosDatabase.actualizarUbicacionPlantacion(
+        id: widget.proyecto.id,
+        latitud: posicionInicial.latitude,
+        longitud: posicionInicial.longitude,
+      );
+      _ultimaPosicion = posicionInicial;
+      await PuntosDatabase.guardarPuntoRecorrido(
+        recorridoId: id,
+        posicion: posicionInicial,
+      );
+      final puntoInicial = LatLng(
+        posicionInicial.latitude,
+        posicionInicial.longitude,
+      );
+      _ruta = [puntoInicial];
+      _mapController.move(puntoInicial, 19);
+      if (mounted) setState(() {});
+      _suscribirUbicacion();
+    } catch (error) {
+      if (mounted) _mostrarAviso('No se pudo iniciar el recorrido: $error');
+    } finally {
+      if (mounted) setState(() => _iniciandoRecorrido = false);
+    }
+  }
+
+  Future<void> _registrarMuestreo() async {
+    if (_registrandoMuestreo || !mounted || _disposed) return;
+    final recorrido = _actual;
+    if (recorrido == null || recorrido.estado != EstadoRecorrido.activo) {
+      _mostrarAviso('Inicia o reanuda el recorrido para registrar un punto.');
+      return;
+    }
+
+    setState(() => _registrandoMuestreo = true);
+    try {
+      final registro = await _pedirDatosMuestreo();
+      if (!mounted || _disposed || registro == null) return;
+
+      if (registro.racimosVerdes == null &&
+          registro.racimosPintones == null &&
+          registro.inflorescencias == null &&
+          registro.fotoPath == null) {
+        _mostrarAviso('Ingresa al menos un dato o adjunta una evidencia.');
+        return;
+      }
+
+      final posicion = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      );
+      if (!mounted || _disposed) return;
+
+      await PuntosDatabase.guardarRegistroRecorrido(
+        recorridoId: recorrido.id,
+        posicion: posicion,
+        racimosVerdes: registro.racimosVerdes,
+        racimosPintones: registro.racimosPintones,
+        inflorescencias: registro.inflorescencias,
+        fotoPath: registro.fotoPath,
+      );
+      if (!mounted || _disposed) return;
+
+      _puntosMuestreo = await PuntosDatabase.obtenerRegistrosRecorrido(
+        recorrido.id,
+      );
+      _registrosMuestreo = await PuntosDatabase.contarRegistrosRecorrido(
+        recorrido.id,
+      );
+
+      if (!mounted || _disposed) return;
+      setState(() {});
+      _mostrarAviso('Registro guardado en la ubicación actual.');
+    } catch (error) {
+      if (mounted && !_disposed) {
+        _mostrarAviso('No se pudo guardar el registro: $error');
+      }
+    } finally {
+      if (mounted && !_disposed) {
+        setState(() => _registrandoMuestreo = false);
+      }
+    }
+  }
+
+  Future<
+    ({
+      int? racimosVerdes,
+      int? racimosPintones,
+      int? inflorescencias,
+      String? fotoPath,
+    })?
+  >
+  _pedirDatosMuestreo() async {
+    if (!mounted || _disposed) return null;
+
+    String verdes = '';
+    String pintones = '';
+    String inflorescencias = '';
+    String? fotoPath;
+    return showDialog<
+      ({
+        int? racimosVerdes,
+        int? racimosPintones,
+        int? inflorescencias,
+        String? fotoPath,
+      })
+    >(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('Registro del punto'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  keyboardType: TextInputType.number,
+                  onChanged: (value) => verdes = value,
+                  decoration: const InputDecoration(
+                    labelText: 'Racimos verdes',
+                  ),
+                ),
+                TextFormField(
+                  keyboardType: TextInputType.number,
+                  onChanged: (value) => pintones = value,
+                  decoration: const InputDecoration(
+                    labelText: 'Racimos pintones',
+                  ),
+                ),
+                TextFormField(
+                  keyboardType: TextInputType.number,
+                  onChanged: (value) => inflorescencias = value,
+                  decoration: const InputDecoration(
+                    labelText: 'Inflorescencias',
+                  ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    final foto = await ImagePicker().pickImage(
+                      source: ImageSource.camera,
+                      imageQuality: 85,
+                    );
+                    if (!dialogContext.mounted || foto == null) return;
+                    setDialogState(() => fotoPath = foto.path);
+                  },
+                  icon: const Icon(Icons.camera_alt),
+                  label: Text(
+                    fotoPath == null ? 'Adjuntar evidencia' : 'Foto adjunta',
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext, rootNavigator: true).pop(),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext, rootNavigator: true).pop((
+                    racimosVerdes: int.tryParse(verdes.trim()),
+                    racimosPintones: int.tryParse(pintones.trim()),
+                    inflorescencias: int.tryParse(inflorescencias.trim()),
+                    fotoPath: fotoPath,
+                  )),
+              child: const Text('Guardar'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _suscribirUbicacion() {
+    final previous = _suscripcion;
+    _suscripcion = null;
+    unawaited(previous?.cancel());
+    final subscription =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 5,
+          ),
+        ).listen((posicion) async {
+          _ultimaPosicion = posicion;
+          final recorrido = _actual;
+          if (!mounted ||
+              _disposed ||
+              recorrido == null ||
+              recorrido.estado != EstadoRecorrido.activo) {
+            return;
+          }
+
+          try {
+            await PuntosDatabase.guardarPuntoRecorrido(
+              recorridoId: recorrido.id,
+              posicion: posicion,
+            );
+            if (!mounted || _disposed) return;
+            final punto = LatLng(posicion.latitude, posicion.longitude);
+            setState(() {
+              if (_ruta.isEmpty ||
+                  _ruta.last.latitude != punto.latitude ||
+                  _ruta.last.longitude != punto.longitude) {
+                _ruta = [..._ruta, punto];
+              }
+            });
+            if (!mounted || _disposed) return;
+            _mapController.move(punto, 19);
+          } catch (error) {
+            if (mounted && !_disposed) {
+              _mostrarAviso('No se pudo guardar la posición: $error');
+            }
+          }
+        });
+    if (!mounted || _disposed) {
+      unawaited(subscription.cancel());
+      return;
+    }
+    _suscripcion = subscription;
+    _suscribirseBrujula();
+  }
+
+  void _suscribirseBrujula() {
+    if (_suscripcionRumbo != null || _disposed) return;
+    final eventos = FlutterCompass.events;
+    if (eventos == null) return;
+    _suscripcionRumbo = eventos.listen(_actualizarRumbo);
+  }
+
+  void _actualizarRumbo(CompassEvent evento) {
+    final rumbo = evento.heading;
+    if (!mounted || _disposed || rumbo == null) return;
+    setState(() => _rumbo = rumbo);
+  }
+
+  void _actualizarVistaMapa(MapCamera camera, bool hasGesture) {
+    if (!mounted || _disposed) return;
+    setState(() {
+      _zoomMapa = camera.zoom;
+      _latitudMapa = camera.center.latitude;
+    });
+  }
+
+  void _seleccionarCoordenada(TapPosition _, LatLng punto) {
+    if (!mounted || _disposed) return;
+    setState(() => _coordenadaSeleccionada = punto);
+  }
+
+  Future<void> _pausar() async {
+    final recorrido = _actual;
+    if (recorrido == null) return;
+    try {
+      await _suscripcion?.cancel();
+      await PuntosDatabase.actualizarEstadoRecorrido(
+        recorrido.id,
+        EstadoRecorrido.pausado,
+      );
+      if (mounted) await _cargarRecorridos();
+    } catch (error) {
+      if (mounted) _mostrarAviso('No se pudo pausar el recorrido: $error');
+    }
+  }
+
+  Future<void> _reanudar() async {
+    try {
+      final recorrido = _actual;
+      if (recorrido == null || !await _prepararUbicacion()) return;
+      await PuntosDatabase.actualizarEstadoRecorrido(
+        recorrido.id,
+        EstadoRecorrido.activo,
+      );
+      if (!mounted) return;
+      await _cargarRecorridos();
+      if (mounted) _suscribirUbicacion();
+    } catch (error) {
+      if (mounted) _mostrarAviso('No se pudo reanudar el recorrido: $error');
+    }
+  }
+
+  Future<void> _finalizar() async {
+    try {
+      final recorrido = _actual;
+      if (recorrido == null) return;
+      await _suscripcion?.cancel();
+      await PuntosDatabase.actualizarEstadoRecorrido(
+        recorrido.id,
+        EstadoRecorrido.finalizado,
+        fin: DateTime.now(),
+      );
+      if (!mounted) return;
+      _actual = null;
+      await _cargarRecorridos();
+    } catch (error) {
+      if (mounted) _mostrarAviso('No se pudo finalizar el recorrido: $error');
+    }
+  }
+
+  Future<void> _exportarRecorrido(
+    Future<void> Function() exportador,
+    String formato,
+  ) async {
+    try {
+      await exportador();
+      if (mounted) {
+        _mostrarAviso('$formato generado correctamente.');
+      }
+    } catch (error) {
+      if (mounted) {
+        _mostrarAviso('No se pudo generar $formato: $error');
+      }
+    }
+  }
+
+  Future<String?> _pedirNombreRecorrido() async {
+    if (!mounted || _disposed) return null;
+
+    var nombre = 'Recorrido ${_recorridos.length + 1}';
+    return showDialog<String>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Nuevo recorrido'),
+        content: TextFormField(
+          initialValue: nombre,
+          autofocus: true,
+          onChanged: (value) => nombre = value,
+          decoration: const InputDecoration(labelText: 'Nombre *'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext, rootNavigator: true).pop(),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final valor = nombre.trim();
+              if (valor.isEmpty) return;
+              Navigator.of(dialogContext, rootNavigator: true).pop(valor);
+            },
+            child: const Text('Iniciar'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _mostrarAviso(String mensaje) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(mensaje)));
+  }
+
+  String _estadoTexto(EstadoRecorrido estado) {
+    switch (estado) {
+      case EstadoRecorrido.activo:
+        return 'Activo';
+      case EstadoRecorrido.pausado:
+        return 'Pausado';
+      case EstadoRecorrido.finalizado:
+        return 'Finalizado';
+      case EstadoRecorrido.detenido:
+        return 'Detenido';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final recorrido = _actual;
+    return Scaffold(
+      appBar: AppBar(
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(widget.proyecto.nombre),
+            const Text('Recorridos', style: TextStyle(fontSize: 12)),
+          ],
+        ),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            tooltip: 'Nuevo recorrido',
+            onPressed: _iniciandoRecorrido ? null : _iniciarRecorrido,
+            icon: const Icon(Icons.add_road),
+          ),
+        ],
+      ),
+      body: _cargando
+          ? const Center(child: CircularProgressIndicator())
+          : _error != null
+          ? Center(child: Text(_error!, textAlign: TextAlign.center))
+          : Stack(
+              children: [
+                Column(
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: FlutterMap(
+                        mapController: _mapController,
+                        options: MapOptions(
+                          initialCenter: LatLng(4.7110, -74.0721),
+                          initialZoom: 6,
+                          maxZoom: 24,
+                          backgroundColor: const Color(0xFF53624F),
+                          onPositionChanged: _actualizarVistaMapa,
+                          onTap: _seleccionarCoordenada,
+                        ),
+                        children: [
+                          TileLayer(
+                            urlTemplate:
+                                'https://server.arcgisonline.com/ArcGIS/rest/'
+                                'services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                            userAgentPackageName: 'com.example.coordenadas_app',
+                            maxNativeZoom: 17,
+                            tileProvider: OfflineTileProvider(),
+                          ),
+                          if (_ruta.length >= 2)
+                            PolylineLayer(
+                              polylines: [
+                                Polyline(
+                                  points: _ruta,
+                                  color: Colors.blue,
+                                  strokeWidth: 5,
+                                ),
+                              ],
+                            ),
+                          if (_ultimaPosicion != null)
+                            MarkerLayer(
+                              markers: [
+                                Marker(
+                                  point: LatLng(
+                                    _ultimaPosicion!.latitude,
+                                    _ultimaPosicion!.longitude,
+                                  ),
+                                  width: 64,
+                                  height: 64,
+                                  child: _MarcadorUbicacion(
+                                    rumbo: _rumbo ?? _ultimaPosicion!.heading,
+                                    precision: _ultimaPosicion!.accuracy,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          if (_coordenadaSeleccionada != null)
+                            MarkerLayer(
+                              markers: [
+                                Marker(
+                                  point: _coordenadaSeleccionada!,
+                                  width: 42,
+                                  height: 42,
+                                  child: const Icon(
+                                    Icons.add_location_alt,
+                                    color: Colors.red,
+                                    size: 36,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          if (_coordenadaSeleccionada != null)
+                            MarkerLayer(
+                              markers: [
+                                Marker(
+                                  point: _coordenadaSeleccionada!,
+                                  width: 42,
+                                  height: 42,
+                                  child: const Icon(
+                                    Icons.add_location_alt,
+                                    color: Colors.red,
+                                    size: 36,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          MarkerLayer(
+                            markers: _puntosMuestreo.map((punto) {
+                              final latitud = (punto['latitud']! as num)
+                                  .toDouble();
+                              final longitud = (punto['longitud']! as num)
+                                  .toDouble();
+                              final verdes = punto['racimos_verdes'];
+                              final pintones = punto['racimos_pintones'];
+                              final inflorescencias = punto['inflorescencias'];
+                              final tieneFoto = punto['foto_path'] != null;
+                              final numero = punto['numero_registro'] as int?;
+                              return Marker(
+                                point: LatLng(latitud, longitud),
+                                width: 52,
+                                height: 58,
+                                child: Tooltip(
+                                  message: [
+                                    'Punto de registro',
+                                    if (verdes != null) 'Verdes: $verdes',
+                                    if (pintones != null) 'Pintones: $pintones',
+                                    if (inflorescencias != null)
+                                      'Inflorescencias: $inflorescencias',
+                                    if (tieneFoto) 'Con evidencia fotográfica',
+                                  ].join('\n'),
+                                  child: Stack(
+                                    alignment: Alignment.center,
+                                    children: [
+                                      Icon(
+                                        tieneFoto
+                                            ? Icons.photo_camera
+                                            : Icons.assignment_turned_in,
+                                        color: Colors.deepOrange,
+                                        size: 40,
+                                      ),
+                                      if (numero != null)
+                                        Positioned(
+                                          top: 0,
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 5,
+                                              vertical: 1,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.white,
+                                              border: Border.all(
+                                                color: Colors.deepOrange,
+                                              ),
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                            ),
+                                            child: Text(
+                                              '$numero',
+                                              style: const TextStyle(
+                                                color: Colors.deepOrange,
+                                                fontSize: 11,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            }).toList(),
+                          ),
+                          RichAttributionWidget(
+                            attributions: [
+                              TextSourceAttribution(
+                                'OpenStreetMap contributors',
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    _IndicadorVistaMapa(zoom: _zoomMapa, latitud: _latitudMapa),
+                    _IndicadorBrujula(
+                      rumbo: _rumbo ?? _ultimaPosicion?.heading,
+                    ),
+                    if (recorrido != null)
+                      Card(
+                        margin: const EdgeInsets.all(12),
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(
+                                recorrido.nombre,
+                                style: Theme.of(context).textTheme.titleLarge,
+                              ),
+                              Text('Estado: ${_estadoTexto(recorrido.estado)}'),
+                              Text('Puntos registrados: ${_ruta.length}'),
+                              Text(
+                                'Registros de plantación: $_registrosMuestreo',
+                              ),
+                              const SizedBox(height: 8),
+                              const Text(
+                                'Acciones del recorrido',
+                                style: TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  FilledButton.icon(
+                                    onPressed:
+                                        recorrido.estado ==
+                                                EstadoRecorrido.activo &&
+                                            !_registrandoMuestreo
+                                        ? _registrarMuestreo
+                                        : null,
+                                    icon: const Icon(Icons.forest),
+                                    label: const Text('Registrar punto'),
+                                  ),
+                                  if (recorrido.estado ==
+                                      EstadoRecorrido.activo)
+                                    FilledButton.icon(
+                                      onPressed: _pausar,
+                                      icon: const Icon(Icons.pause),
+                                      label: const Text('Pausar'),
+                                    ),
+                                  if (recorrido.estado ==
+                                      EstadoRecorrido.pausado)
+                                    FilledButton.icon(
+                                      onPressed: _reanudar,
+                                      icon: const Icon(Icons.play_arrow),
+                                      label: const Text('Reanudar'),
+                                    ),
+                                  OutlinedButton.icon(
+                                    onPressed: _finalizar,
+                                    icon: const Icon(Icons.stop),
+                                    label: const Text('Finalizar'),
+                                  ),
+                                ],
+                              ),
+                              const Divider(),
+                              const Text(
+                                'Exportar',
+                                style: TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 8),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  OutlinedButton.icon(
+                                    onPressed: () => _exportarRecorrido(
+                                      () =>
+                                          ExportadorDatos.compartirRecorridoExcel(
+                                            recorrido.id,
+                                          ),
+                                      'el Excel de registros',
+                                    ),
+                                    icon: const Icon(Icons.table_view),
+                                    label: const Text('Registros Excel'),
+                                  ),
+                                  OutlinedButton.icon(
+                                    onPressed: () => _exportarRecorrido(
+                                      () =>
+                                          ExportadorDatos.compartirRecorridoKml(
+                                            recorrido.id,
+                                          ),
+                                      'el KML del recorrido',
+                                    ),
+                                    icon: const Icon(Icons.public),
+                                    label: const Text('Ruta y registros KML'),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      )
+                    else
+                      Padding(
+                        padding: const EdgeInsets.all(20),
+                        child: FilledButton.icon(
+                          onPressed: _iniciandoRecorrido
+                              ? null
+                              : _iniciarRecorrido,
+                          icon: const Icon(Icons.route),
+                          label: const Text('Iniciar recorrido'),
+                        ),
+                      ),
+                  ],
+                ),
+                if (_iniciandoRecorrido || _registrandoMuestreo)
+                  const _CargandoOperacion(mensaje: 'Guardando información...'),
+              ],
+            ),
+    );
+  }
+}
