@@ -425,6 +425,94 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                         maxNativeZoom: 17,
                         tileProvider: OfflineTileProvider(),
                       ),
+                      MarkerLayer(
+                        markers: _plantaciones
+                            .where(
+                              (plantacion) =>
+                                  plantacion.latitud != null &&
+                                  plantacion.longitud != null,
+                            )
+                            .map((plantacion) {
+                              final punto = LatLng(
+                                plantacion.latitud!,
+                                plantacion.longitud!,
+                              );
+                              return Marker(
+                                point: punto,
+                                width: 220,
+                                height: 38,
+                                alignment: Alignment.center,
+                                child: GestureDetector(
+                                  onTap: () => _mapController.move(punto, 18),
+                                  child: Tooltip(
+                                    message: 'Plantación: ${plantacion.nombre}',
+                                    child: Stack(
+                                      children: [
+                                        Positioned(
+                                          left: 101,
+                                          top: 10,
+                                          child: Container(
+                                            width: 18,
+                                            height: 18,
+                                            decoration: BoxDecoration(
+                                              color: Colors.green.shade700,
+                                              shape: BoxShape.circle,
+                                              border: Border.all(
+                                                color: Colors.white,
+                                                width: 3,
+                                              ),
+                                              boxShadow: const [
+                                                BoxShadow(
+                                                  color: Colors.black38,
+                                                  blurRadius: 4,
+                                                  offset: Offset(0, 2),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                        Positioned(
+                                          left: 125,
+                                          right: 0,
+                                          top: 6,
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 8,
+                                              vertical: 4,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.white.withValues(
+                                                alpha: 0.94,
+                                              ),
+                                              borderRadius:
+                                                  BorderRadius.circular(12),
+                                              boxShadow: const [
+                                                BoxShadow(
+                                                  color: Colors.black26,
+                                                  blurRadius: 4,
+                                                ),
+                                              ],
+                                            ),
+                                            child: Text(
+                                              plantacion.nombre,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w600,
+                                                color: Colors.black87,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              );
+                            })
+                            .toList(),
+                      ),
                       if (posicion != null)
                         MarkerLayer(
                           markers: [
@@ -1026,15 +1114,47 @@ class PuntosDatabase {
 
   static Future<void> actualizarDatosPlantacion({
     required int id,
-    required int? cantidadPalmas,
+    required String nombre,
+    required int cantidadPalmas,
   }) async {
     final database = await PuntosDatabase.database;
     await database.update(
       'proyectos',
-      {'cantidad_palmas': cantidadPalmas},
+      {'nombre': nombre, 'cantidad_palmas': cantidadPalmas},
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  static Future<void> eliminarPlantacion(int id) async {
+    final database = await PuntosDatabase.database;
+    await database.transaction((transaction) async {
+      await transaction.delete(
+        'recorrido_puntos',
+        where:
+            'recorrido_id IN '
+            '(SELECT id FROM recorridos WHERE proyecto_id = ?)',
+        whereArgs: [id],
+      );
+      await transaction.delete(
+        'recorridos',
+        where: 'proyecto_id = ?',
+        whereArgs: [id],
+      );
+      await transaction.delete('proyectos', where: 'id = ?', whereArgs: [id]);
+    });
+  }
+
+  static Future<void> eliminarRecorrido(int id) async {
+    final database = await PuntosDatabase.database;
+    await database.transaction((transaction) async {
+      await transaction.delete(
+        'recorrido_puntos',
+        where: 'recorrido_id = ?',
+        whereArgs: [id],
+      );
+      await transaction.delete('recorridos', where: 'id = ?', whereArgs: [id]);
+    });
   }
 
   static Future<void> actualizarUbicacionPlantacion({
@@ -1162,6 +1282,39 @@ class PuntosDatabase {
       'altitud': posicion.altitude,
       'precision': posicion.accuracy,
       'fecha': posicion.timestamp.toIso8601String(),
+    });
+  }
+
+  static Future<void> guardarPuntoInicialRecorrido({
+    required int proyectoId,
+    required int recorridoId,
+    required Position posicion,
+  }) async {
+    final database = await PuntosDatabase.database;
+    await database.transaction((transaction) async {
+      final puntoId = await transaction.insert('recorrido_puntos', {
+        'recorrido_id': recorridoId,
+        'latitud': posicion.latitude,
+        'longitud': posicion.longitude,
+        'altitud': posicion.altitude,
+        'precision': posicion.accuracy,
+        'fecha': posicion.timestamp.toIso8601String(),
+      });
+      final puntoGuardado = (await transaction.query(
+        'recorrido_puntos',
+        columns: ['latitud', 'longitud'],
+        where: 'id = ?',
+        whereArgs: [puntoId],
+      )).single;
+      await transaction.update(
+        'proyectos',
+        {
+          'latitud': puntoGuardado['latitud'],
+          'longitud': puntoGuardado['longitud'],
+        },
+        where: 'id = ? AND (latitud IS NULL OR longitud IS NULL)',
+        whereArgs: [proyectoId],
+      );
     });
   }
 
@@ -1428,6 +1581,8 @@ class _ProyectosPageState extends State<ProyectosPage> {
   bool _cargando = true;
   bool _creando = false;
   bool _abriendoRecorrido = false;
+  final Set<int> _plantacionesEnCurso = {};
+  final Set<int> _recorridosEnCurso = {};
   String? _error;
 
   @override
@@ -1512,47 +1667,13 @@ class _ProyectosPageState extends State<ProyectosPage> {
   }
 
   Future<void> _editarDatosPlantacion(Proyecto proyecto) async {
-    var cantidadTexto = proyecto.cantidadPalmas?.toString() ?? '';
-    final cantidad = await showDialog<int?>(
-      context: context,
-      useRootNavigator: true,
-      builder: (dialogContext) => AlertDialog(
-        title: Text('Editar ${proyecto.nombre}'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextFormField(
-              initialValue: cantidadTexto,
-              keyboardType: TextInputType.number,
-              onChanged: (value) => cantidadTexto = value,
-              decoration: const InputDecoration(
-                labelText: 'Cantidad de palmas',
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () =>
-                Navigator.of(dialogContext, rootNavigator: true).pop(),
-            child: const Text('Cancelar'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final valor = int.tryParse(cantidadTexto.trim());
-              if (valor == null || valor < 0) return;
-              Navigator.of(dialogContext, rootNavigator: true).pop(valor);
-            },
-            child: const Text('Guardar'),
-          ),
-        ],
-      ),
-    );
-    if (cantidad != null && mounted) {
+    final datos = await _pedirDatosProyecto(proyecto: proyecto);
+    if (datos != null && mounted) {
       try {
         await PuntosDatabase.actualizarDatosPlantacion(
           id: proyecto.id,
-          cantidadPalmas: cantidad,
+          nombre: datos.nombre,
+          cantidadPalmas: datos.cantidadPalmas,
         );
         await _cargarProyectos();
       } catch (error) {
@@ -1564,6 +1685,108 @@ class _ProyectosPageState extends State<ProyectosPage> {
           );
         }
       }
+    }
+  }
+
+  Future<void> _eliminarPlantacion(Proyecto proyecto) async {
+    if (_plantacionesEnCurso.contains(proyecto.id)) return;
+    final recorridos = _recorridosPorPlantacion[proyecto.id] ?? [];
+    final confirmar = await showDialog<bool>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Eliminar plantación'),
+        content: Text(
+          '¿Eliminar "${proyecto.nombre}" y sus ${recorridos.length} '
+          'recorridos con todos sus puntos? Esta acción no se puede deshacer.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext, rootNavigator: true).pop(false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
+            onPressed: () =>
+                Navigator.of(dialogContext, rootNavigator: true).pop(true),
+            child: const Text('Eliminar todo'),
+          ),
+        ],
+      ),
+    );
+    if (confirmar != true || !mounted) return;
+    setState(() => _plantacionesEnCurso.add(proyecto.id));
+    try {
+      await PuntosDatabase.eliminarPlantacion(proyecto.id);
+      await _cargarProyectos();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Plantación "${proyecto.nombre}" eliminada.')),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo eliminar la plantación: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _plantacionesEnCurso.remove(proyecto.id));
+    }
+  }
+
+  Future<void> _eliminarRecorrido(
+    Proyecto proyecto,
+    Recorrido recorrido,
+  ) async {
+    if (_recorridosEnCurso.contains(recorrido.id)) return;
+    final confirmar = await showDialog<bool>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Eliminar recorrido'),
+        content: Text(
+          '¿Eliminar "${recorrido.nombre}" y todos sus puntos y registros? '
+          'Esta acción no se puede deshacer.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext, rootNavigator: true).pop(false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
+            onPressed: () =>
+                Navigator.of(dialogContext, rootNavigator: true).pop(true),
+            child: const Text('Eliminar'),
+          ),
+        ],
+      ),
+    );
+    if (confirmar != true || !mounted) return;
+    setState(() => _recorridosEnCurso.add(recorrido.id));
+    try {
+      await PuntosDatabase.eliminarRecorrido(recorrido.id);
+      await _cargarProyectos();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Recorrido "${recorrido.nombre}" eliminado.')),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo eliminar el recorrido: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _recorridosEnCurso.remove(recorrido.id));
     }
   }
 
@@ -1580,16 +1803,20 @@ class _ProyectosPageState extends State<ProyectosPage> {
     }
   }
 
-  Future<({String nombre, int cantidadPalmas})?> _pedirDatosProyecto() async {
+  Future<({String nombre, int cantidadPalmas})?> _pedirDatosProyecto({
+    Proyecto? proyecto,
+  }) async {
     if (!mounted) return null;
-    var nombre = '';
-    var cantidadTexto = '';
+    var nombre = proyecto?.nombre ?? '';
+    var cantidadTexto = proyecto?.cantidadPalmas?.toString() ?? '';
     return showDialog<({String nombre, int cantidadPalmas})>(
       context: context,
       useRootNavigator: true,
       builder: (dialogContext) => StatefulBuilder(
         builder: (dialogContext, dialogSetState) => AlertDialog(
-          title: const Text('Nueva plantación'),
+          title: Text(
+            proyecto == null ? 'Nueva plantación' : 'Editar plantación',
+          ),
           content: SizedBox(
             width: 420,
             child: SingleChildScrollView(
@@ -1598,6 +1825,7 @@ class _ProyectosPageState extends State<ProyectosPage> {
                 children: [
                   TextFormField(
                     autofocus: true,
+                    initialValue: nombre,
                     onChanged: (value) => nombre = value,
                     decoration: const InputDecoration(
                       labelText: 'Nombre *',
@@ -1605,6 +1833,7 @@ class _ProyectosPageState extends State<ProyectosPage> {
                     ),
                   ),
                   TextFormField(
+                    initialValue: cantidadTexto,
                     keyboardType: TextInputType.number,
                     onChanged: (value) => cantidadTexto = value,
                     decoration: const InputDecoration(
@@ -1691,7 +1920,7 @@ class _ProyectosPageState extends State<ProyectosPage> {
                       ].join(' · '),
                     ),
                     trailing: IconButton(
-                      tooltip: 'Editar cantidad de palmas',
+                      tooltip: 'Editar plantación',
                       onPressed: () => _editarDatosPlantacion(proyecto),
                       icon: const Icon(Icons.edit),
                     ),
@@ -1721,11 +1950,42 @@ class _ProyectosPageState extends State<ProyectosPage> {
                             subtitle: Text(
                               'Estado: ${_estadoTextoRecorrido(recorrido.estado)}',
                             ),
+                            trailing: IconButton(
+                              tooltip: 'Eliminar recorrido y sus puntos',
+                              onPressed:
+                                  _recorridosEnCurso.contains(recorrido.id)
+                                  ? null
+                                  : () =>
+                                        _eliminarRecorrido(proyecto, recorrido),
+                              icon: const Icon(Icons.delete_outline),
+                              color: Theme.of(context).colorScheme.error,
+                            ),
                             onTap: _abriendoRecorrido
                                 ? null
                                 : () => _abrirRecorrido(proyecto),
                           ),
                         ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+                        child: Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton.icon(
+                            onPressed:
+                                _plantacionesEnCurso.contains(proyecto.id)
+                                ? null
+                                : () => _eliminarPlantacion(proyecto),
+                            icon: const Icon(Icons.delete_outline),
+                            label: const Text(
+                              'Eliminar plantación y recorridos',
+                            ),
+                            style: TextButton.styleFrom(
+                              foregroundColor: Theme.of(context)
+                                  .colorScheme
+                                  .error,
+                            ),
+                          ),
+                        ),
+                      ),
                       Padding(
                         padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                         child: SizedBox(
@@ -1777,6 +2037,8 @@ class _RecorridosPageState extends State<RecorridosPage>
   List<LatLng> _ruta = [];
   List<Map<String, Object?>> _puntosMuestreo = [];
   Recorrido? _actual;
+  Recorrido? _recorridoEnCurso;
+  int? _recorridoSeleccionadoId;
   Position? _ultimaPosicion;
   LatLng? _coordenadaSeleccionada;
   double? _rumbo;
@@ -1818,7 +2080,7 @@ class _RecorridosPageState extends State<RecorridosPage>
 
   Future<void> _reanudarRecorridoAlVolver() async {
     await _cargarRecorridos();
-    final recorrido = _actual;
+    final recorrido = _recorridoEnCurso;
     if (!mounted ||
         _disposed ||
         recorrido == null ||
@@ -1837,6 +2099,36 @@ class _RecorridosPageState extends State<RecorridosPage>
     }
   }
 
+  Future<void> _mostrarRecorrido(Recorrido recorrido) async {
+    if (!mounted || _disposed) return;
+    _recorridoSeleccionadoId = recorrido.id;
+    setState(() {
+      _actual = recorrido;
+    });
+    _ruta = await PuntosDatabase.obtenerPuntosRecorrido(recorrido.id);
+    _puntosMuestreo = await PuntosDatabase.obtenerRegistrosRecorrido(
+      recorrido.id,
+    );
+    _registrosMuestreo = await PuntosDatabase.contarRegistrosRecorrido(
+      recorrido.id,
+    );
+    if (_ruta.isNotEmpty) {
+      final ultima = _ruta.last;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_disposed) {
+          _mapController.move(ultima, 19);
+        }
+      });
+    }
+    if (!_disposed &&
+        !_iniciandoRecorrido &&
+        _recorridoEnCurso?.estado == EstadoRecorrido.activo &&
+        _suscripcion == null) {
+      _suscribirUbicacion();
+    }
+    if (mounted) setState(() {});
+  }
+
   Future<void> _cargarRecorridos() async {
     if (defaultTargetPlatform != TargetPlatform.android &&
         defaultTargetPlatform != TargetPlatform.iOS) {
@@ -1852,48 +2144,39 @@ class _RecorridosPageState extends State<RecorridosPage>
         widget.proyecto.id,
       );
       if (!mounted) return;
+      Recorrido? enCurso;
+      for (final item in recorridos) {
+        if (item.estado == EstadoRecorrido.activo ||
+            item.estado == EstadoRecorrido.pausado) {
+          enCurso = item;
+          break;
+        }
+      }
+      Recorrido? seleccion;
+      if (_recorridoSeleccionadoId != null) {
+        for (final item in recorridos) {
+          if (item.id == _recorridoSeleccionadoId) {
+            seleccion = item;
+            break;
+          }
+        }
+      }
+      seleccion ??= enCurso;
+      seleccion ??= recorridos.isEmpty ? null : recorridos.first;
       setState(() {
         _recorridos = recorridos;
-        _actual = recorridos.firstWhere(
-          (item) =>
-              item.estado == EstadoRecorrido.activo ||
-              item.estado == EstadoRecorrido.pausado,
-          orElse: () => recorridos.isEmpty
-              ? Recorrido(
-                  id: -1,
-                  proyectoId: widget.proyecto.id,
-                  nombre: '',
-                  estado: EstadoRecorrido.detenido,
-                  inicio: DateTime(0),
-                )
-              : recorridos.first,
-        );
-        if (_actual?.id == -1) _actual = null;
+        _recorridoEnCurso = enCurso;
         _cargando = false;
       });
-      if (_actual != null) {
-        _ruta = await PuntosDatabase.obtenerPuntosRecorrido(_actual!.id);
-        _puntosMuestreo = await PuntosDatabase.obtenerRegistrosRecorrido(
-          _actual!.id,
-        );
-        _registrosMuestreo = await PuntosDatabase.contarRegistrosRecorrido(
-          _actual!.id,
-        );
-        if (_ruta.isNotEmpty) {
-          final ultima = _ruta.last;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted && !_disposed) {
-              _mapController.move(ultima, 19);
-            }
-          });
-        }
+      if (seleccion != null) {
+        await _mostrarRecorrido(seleccion);
+      } else {
+        _actual = null;
+        _recorridoSeleccionadoId = null;
+        _ruta = [];
+        _puntosMuestreo = [];
+        _registrosMuestreo = 0;
         if (mounted) setState(() {});
-        if (!_disposed &&
-            !_iniciandoRecorrido &&
-            _actual!.estado == EstadoRecorrido.activo &&
-            _suscripcion == null) {
-          _suscribirUbicacion();
-        }
       }
     } catch (error) {
       if (!mounted) return;
@@ -1931,6 +2214,13 @@ class _RecorridosPageState extends State<RecorridosPage>
       if (nombre == null || !mounted || _disposed) return;
       if (!await _prepararUbicacion()) return;
       if (!mounted || _disposed) return;
+      final posicionInicial = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation,
+          timeLimit: Duration(seconds: 30),
+        ),
+      );
+      if (!mounted || _disposed) return;
       final id = await PuntosDatabase.crearRecorrido(
         proyectoId: widget.proyecto.id,
         nombre: nombre,
@@ -1938,18 +2228,15 @@ class _RecorridosPageState extends State<RecorridosPage>
       final recorridos = await PuntosDatabase.obtenerRecorridos(
         widget.proyecto.id,
       );
-      _actual = recorridos.firstWhere((item) => item.id == id);
+      final recorridoCreado = recorridos.firstWhere((item) => item.id == id);
+      _actual = recorridoCreado;
+      _recorridoEnCurso = recorridoCreado;
+      _recorridoSeleccionadoId = id;
       _ruta = [];
       if (mounted) setState(() => _recorridos = recorridos);
-      final posicionInicial = await Geolocator.getCurrentPosition();
-      if (!mounted || _disposed) return;
-      await PuntosDatabase.actualizarUbicacionPlantacion(
-        id: widget.proyecto.id,
-        latitud: posicionInicial.latitude,
-        longitud: posicionInicial.longitude,
-      );
       _ultimaPosicion = posicionInicial;
-      await PuntosDatabase.guardarPuntoRecorrido(
+      await PuntosDatabase.guardarPuntoInicialRecorrido(
+        proyectoId: widget.proyecto.id,
         recorridoId: id,
         posicion: posicionInicial,
       );
@@ -1970,7 +2257,7 @@ class _RecorridosPageState extends State<RecorridosPage>
 
   Future<void> _registrarMuestreo() async {
     if (_registrandoMuestreo || !mounted || _disposed) return;
-    final recorrido = _actual;
+    final recorrido = _recorridoEnCurso;
     if (recorrido == null || recorrido.estado != EstadoRecorrido.activo) {
       _mostrarAviso('Inicia o reanuda el recorrido para registrar un punto.');
       return;
@@ -2147,6 +2434,7 @@ class _RecorridosPageState extends State<RecorridosPage>
             );
             if (!mounted || _disposed) return;
             final punto = LatLng(posicion.latitude, posicion.longitude);
+            if (_actual?.id != recorrido.id) return;
             setState(() {
               if (_ruta.isEmpty ||
                   _ruta.last.latitude != punto.latitude ||
@@ -2198,9 +2486,15 @@ class _RecorridosPageState extends State<RecorridosPage>
 
   Future<void> _pausar() async {
     final recorrido = _actual;
-    if (recorrido == null) return;
+    if (recorrido == null ||
+        recorrido.estado != EstadoRecorrido.activo ||
+        _recorridoEnCurso?.id != recorrido.id) {
+      return;
+    }
     try {
-      await _suscripcion?.cancel();
+      final subscription = _suscripcion;
+      _suscripcion = null;
+      await subscription?.cancel();
       await PuntosDatabase.actualizarEstadoRecorrido(
         recorrido.id,
         EstadoRecorrido.pausado,
@@ -2214,7 +2508,11 @@ class _RecorridosPageState extends State<RecorridosPage>
   Future<void> _reanudar() async {
     try {
       final recorrido = _actual;
-      if (recorrido == null || !await _prepararUbicacion()) return;
+      if (recorrido == null ||
+          recorrido.estado != EstadoRecorrido.pausado ||
+          !await _prepararUbicacion()) {
+        return;
+      }
       await PuntosDatabase.actualizarEstadoRecorrido(
         recorrido.id,
         EstadoRecorrido.activo,
@@ -2231,14 +2529,17 @@ class _RecorridosPageState extends State<RecorridosPage>
     try {
       final recorrido = _actual;
       if (recorrido == null) return;
-      await _suscripcion?.cancel();
+      final subscription = _suscripcion;
+      _suscripcion = null;
+      await subscription?.cancel();
       await PuntosDatabase.actualizarEstadoRecorrido(
         recorrido.id,
         EstadoRecorrido.finalizado,
         fin: DateTime.now(),
       );
       if (!mounted) return;
-      _actual = null;
+      _recorridoEnCurso = null;
+      _recorridoSeleccionadoId = recorrido.id;
       await _cargarRecorridos();
     } catch (error) {
       if (mounted) _mostrarAviso('No se pudo finalizar el recorrido: $error');
@@ -2311,6 +2612,32 @@ class _RecorridosPageState extends State<RecorridosPage>
         return 'Finalizado';
       case EstadoRecorrido.detenido:
         return 'Detenido';
+    }
+  }
+
+  Color _colorEstadoRecorrido(EstadoRecorrido estado) {
+    switch (estado) {
+      case EstadoRecorrido.activo:
+        return Colors.green;
+      case EstadoRecorrido.pausado:
+        return Colors.orange;
+      case EstadoRecorrido.finalizado:
+        return Colors.blueGrey;
+      case EstadoRecorrido.detenido:
+        return Colors.grey;
+    }
+  }
+
+  IconData _iconoEstadoRecorrido(EstadoRecorrido estado) {
+    switch (estado) {
+      case EstadoRecorrido.activo:
+        return Icons.radio_button_checked;
+      case EstadoRecorrido.pausado:
+        return Icons.pause_circle_outline;
+      case EstadoRecorrido.finalizado:
+        return Icons.check_circle_outline;
+      case EstadoRecorrido.detenido:
+        return Icons.cancel_outlined;
     }
   }
 
@@ -2434,8 +2761,8 @@ class _RecorridosPageState extends State<RecorridosPage>
                               final numero = punto['numero_registro'] as int?;
                               return Marker(
                                 point: LatLng(latitud, longitud),
-                                width: 52,
-                                height: 58,
+                                width: 32,
+                                height: 32,
                                 child: Tooltip(
                                   message: [
                                     'Punto de registro',
@@ -2445,43 +2772,35 @@ class _RecorridosPageState extends State<RecorridosPage>
                                       'Inflorescencias: $inflorescencias',
                                     if (tieneFoto) 'Con evidencia fotográfica',
                                   ].join('\n'),
-                                  child: Stack(
-                                    alignment: Alignment.center,
-                                    children: [
-                                      Icon(
-                                        tieneFoto
-                                            ? Icons.photo_camera
-                                            : Icons.assignment_turned_in,
-                                        color: Colors.deepOrange,
-                                        size: 40,
+                                  child: Container(
+                                    width: 28,
+                                    height: 28,
+                                    decoration: BoxDecoration(
+                                      color: tieneFoto
+                                          ? Colors.orangeAccent
+                                          : Colors.deepOrange,
+                                      border: Border.all(
+                                        color: Colors.white,
+                                        width: 2,
                                       ),
-                                      if (numero != null)
-                                        Positioned(
-                                          top: 0,
-                                          child: Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 5,
-                                              vertical: 1,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: Colors.white,
-                                              border: Border.all(
-                                                color: Colors.deepOrange,
-                                              ),
-                                              borderRadius:
-                                                  BorderRadius.circular(8),
-                                            ),
-                                            child: Text(
-                                              '$numero',
-                                              style: const TextStyle(
-                                                color: Colors.deepOrange,
-                                                fontSize: 11,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                            ),
-                                          ),
+                                      borderRadius: BorderRadius.circular(14),
+                                      boxShadow: const [
+                                        BoxShadow(
+                                          color: Colors.black26,
+                                          blurRadius: 4,
+                                          offset: Offset(0, 2),
                                         ),
-                                    ],
+                                      ],
+                                    ),
+                                    alignment: Alignment.center,
+                                    child: Text(
+                                      numero != null ? '$numero' : '',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
                                   ),
                                 ),
                               );
@@ -2497,6 +2816,46 @@ class _RecorridosPageState extends State<RecorridosPage>
                         ],
                       ),
                     ),
+                    if (_recorridos.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: _recorridos.map((recorridoItem) {
+                              final seleccionado =
+                                  _actual?.id == recorridoItem.id;
+                              return Padding(
+                                padding: const EdgeInsets.only(right: 8),
+                                child: ChoiceChip(
+                                  avatar: Icon(
+                                    _iconoEstadoRecorrido(recorridoItem.estado),
+                                    size: 18,
+                                    color: _colorEstadoRecorrido(
+                                      recorridoItem.estado,
+                                    ),
+                                  ),
+                                  label: Text(
+                                    recorridoItem.nombre.isNotEmpty
+                                        ? recorridoItem.nombre
+                                        : 'Recorrido ${recorridoItem.id}',
+                                  ),
+                                  selected: seleccionado,
+                                  selectedColor: _colorEstadoRecorrido(
+                                    recorridoItem.estado,
+                                  ).withValues(alpha: 0.18),
+                                  onSelected: (_) {
+                                    if (!seleccionado) {
+                                      _mostrarRecorrido(recorridoItem);
+                                    }
+                                  },
+                                  showCheckmark: false,
+                                ),
+                              );
+                            }).toList(),
+                          ),
+                        ),
+                      ),
                     _IndicadorVistaMapa(zoom: _zoomMapa, latitud: _latitudMapa),
                     _IndicadorBrujula(
                       rumbo: _rumbo ?? _ultimaPosicion?.heading,
@@ -2513,51 +2872,86 @@ class _RecorridosPageState extends State<RecorridosPage>
                                 recorrido.nombre,
                                 style: Theme.of(context).textTheme.titleLarge,
                               ),
-                              Text('Estado: ${_estadoTexto(recorrido.estado)}'),
+                              Row(
+                                children: [
+                                  Icon(
+                                    _iconoEstadoRecorrido(recorrido.estado),
+                                    size: 18,
+                                    color: _colorEstadoRecorrido(
+                                      recorrido.estado,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'Estado: ${_estadoTexto(recorrido.estado)}',
+                                    style: TextStyle(
+                                      color: _colorEstadoRecorrido(
+                                        recorrido.estado,
+                                      ),
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              if (recorrido.estado ==
+                                      EstadoRecorrido.finalizado &&
+                                  recorrido.fin != null)
+                                Text(
+                                  'Finalizado: ${recorrido.fin!.toLocal().toString().substring(0, 16)}',
+                                  style: Theme.of(context).textTheme.bodySmall,
+                                ),
                               Text('Puntos registrados: ${_ruta.length}'),
                               Text(
                                 'Registros de plantación: $_registrosMuestreo',
                               ),
                               const SizedBox(height: 8),
-                              const Text(
-                                'Acciones del recorrido',
-                                style: TextStyle(fontWeight: FontWeight.bold),
-                              ),
-                              Wrap(
-                                spacing: 8,
-                                runSpacing: 8,
-                                children: [
-                                  FilledButton.icon(
-                                    onPressed:
-                                        recorrido.estado ==
-                                                EstadoRecorrido.activo &&
-                                            !_registrandoMuestreo
-                                        ? _registrarMuestreo
-                                        : null,
-                                    icon: const Icon(Icons.forest),
-                                    label: const Text('Registrar punto'),
-                                  ),
-                                  if (recorrido.estado ==
-                                      EstadoRecorrido.activo)
-                                    FilledButton.icon(
-                                      onPressed: _pausar,
-                                      icon: const Icon(Icons.pause),
-                                      label: const Text('Pausar'),
+                              if (recorrido.estado == EstadoRecorrido.activo ||
+                                  recorrido.estado ==
+                                      EstadoRecorrido.pausado) ...[
+                                const Text(
+                                  'Acciones del recorrido',
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    if (recorrido.estado ==
+                                        EstadoRecorrido.activo)
+                                      FilledButton.icon(
+                                        onPressed: _registrandoMuestreo
+                                            ? null
+                                            : _registrarMuestreo,
+                                        icon: const Icon(Icons.forest),
+                                        label: const Text('Registrar punto'),
+                                      ),
+                                    if (recorrido.estado ==
+                                        EstadoRecorrido.activo)
+                                      FilledButton.icon(
+                                        onPressed: _pausar,
+                                        icon: const Icon(Icons.pause),
+                                        label: const Text('Pausar'),
+                                      ),
+                                    if (recorrido.estado ==
+                                        EstadoRecorrido.pausado)
+                                      FilledButton.icon(
+                                        onPressed: _reanudar,
+                                        icon: const Icon(Icons.play_arrow),
+                                        label: const Text('Reanudar'),
+                                      ),
+                                    OutlinedButton.icon(
+                                      onPressed: _finalizar,
+                                      icon: const Icon(Icons.stop),
+                                      label: const Text('Finalizar'),
                                     ),
-                                  if (recorrido.estado ==
-                                      EstadoRecorrido.pausado)
-                                    FilledButton.icon(
-                                      onPressed: _reanudar,
-                                      icon: const Icon(Icons.play_arrow),
-                                      label: const Text('Reanudar'),
-                                    ),
-                                  OutlinedButton.icon(
-                                    onPressed: _finalizar,
-                                    icon: const Icon(Icons.stop),
-                                    label: const Text('Finalizar'),
-                                  ),
-                                ],
-                              ),
+                                  ],
+                                ),
+                              ] else if (recorrido.estado ==
+                                  EstadoRecorrido.finalizado)
+                                const Text(
+                                  'Recorrido finalizado · vista de consulta',
+                                  style: TextStyle(color: Colors.blueGrey),
+                                ),
                               const Divider(),
                               const Text(
                                 'Exportar',
