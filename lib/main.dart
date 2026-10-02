@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:excel/excel.dart' hide Border;
+import 'package:file_picker/file_picker.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
@@ -366,6 +367,95 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
     }
   }
 
+  Future<void> _buscarCoordenadas() async {
+    var coordenadasTexto = '';
+    final punto = await showDialog<LatLng>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) {
+        var error = '';
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) => AlertDialog(
+            title: const Text('Ir a coordenadas'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  autofocus: true,
+                  keyboardType: TextInputType.text,
+                  onChanged: (value) => coordenadasTexto = value,
+                  decoration: const InputDecoration(
+                    labelText: 'Latitud, longitud',
+                    hintText: 'Ej. 4.7110, -74.0721',
+                  ),
+                ),
+                if (error.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      error,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () =>
+                    Navigator.of(dialogContext, rootNavigator: true).pop(),
+                child: const Text('Cancelar'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final entrada = coordenadasTexto.trim();
+                  final List<String> valores;
+                  if (entrada.contains(';')) {
+                    valores = entrada.split(';');
+                  } else if (entrada.contains(',')) {
+                    valores = entrada.split(',');
+                  } else {
+                    valores = entrada.split(RegExp(r'\s+'));
+                  }
+                  final latitud = valores.length == 2
+                      ? double.tryParse(valores[0].trim().replaceAll(',', '.'))
+                      : null;
+                  final longitud = valores.length == 2
+                      ? double.tryParse(valores[1].trim().replaceAll(',', '.'))
+                      : null;
+                  if (latitud == null ||
+                      longitud == null ||
+                      !latitud.isFinite ||
+                      !longitud.isFinite ||
+                      latitud < -90 ||
+                      latitud > 90 ||
+                      longitud < -180 ||
+                      longitud > 180) {
+                    setDialogState(
+                      () => error =
+                          'Ingresa latitud y longitud, separadas por coma, punto y coma o espacio. '
+                          'Latitud: -90 a 90; longitud: -180 a 180.',
+                    );
+                    return;
+                  }
+                  Navigator.of(
+                    dialogContext,
+                    rootNavigator: true,
+                  ).pop(LatLng(latitud, longitud));
+                },
+                child: const Text('Ubicar'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    if (!mounted || _disposed || punto == null) return;
+    setState(() => _coordenadaSeleccionada = punto);
+    _mapController.move(punto, 19);
+  }
+
   void _mostrarAviso(String mensaje) {
     if (!mounted || _disposed) return;
     ScaffoldMessenger.of(context)
@@ -380,6 +470,11 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
         title: const Text('Recorridos'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          IconButton(
+            tooltip: 'Ir a coordenadas',
+            onPressed: _buscarCoordenadas,
+            icon: const Icon(Icons.travel_explore),
+          ),
           IconButton(
             tooltip: 'Descargar zona para uso offline',
             onPressed: _posicion == null || _descargandoZonaActiva
@@ -1418,6 +1513,284 @@ class PuntosDatabase {
   }
 }
 
+class ResumenTransferenciaPlantacion {
+  const ResumenTransferenciaPlantacion({
+    required this.nombre,
+    required this.cantidadRecorridos,
+    required this.cantidadPuntos,
+  });
+
+  final String nombre;
+  final int cantidadRecorridos;
+  final int cantidadPuntos;
+}
+
+class TransferenciaPlantacion {
+  static const String _formato = 'coordenadas_plantacion';
+  static const int _version = 1;
+
+  static Future<Uint8List> exportar(int proyectoId) async {
+    final database = await PuntosDatabase.database;
+    final plantacion = (await database.query(
+      'proyectos',
+      where: 'id = ?',
+      whereArgs: [proyectoId],
+      limit: 1,
+    )).first;
+    final proyecto = Map<String, Object?>.from(plantacion);
+    await _incluirFoto(proyecto);
+
+    final recorridos = await database.query(
+      'recorridos',
+      where: 'proyecto_id = ?',
+      whereArgs: [proyectoId],
+      orderBy: 'id',
+    );
+    final recorridosExportados = <Map<String, Object?>>[];
+    for (final recorrido in recorridos) {
+      final puntos = await database.query(
+        'recorrido_puntos',
+        where: 'recorrido_id = ?',
+        whereArgs: [recorrido['id']],
+        orderBy: 'fecha, id',
+      );
+      final puntosExportados = <Map<String, Object?>>[];
+      for (final punto in puntos) {
+        final puntoExportado = Map<String, Object?>.from(punto);
+        await _incluirFoto(puntoExportado);
+        puntosExportados.add(puntoExportado);
+      }
+      recorridosExportados.add({
+        'recorrido': Map<String, Object?>.from(recorrido),
+        'puntos': puntosExportados,
+      });
+    }
+    final json = jsonEncode({
+      'format': _formato,
+      'version': _version,
+      'exported_at': DateTime.now().toIso8601String(),
+      'project': proyecto,
+      'routes': recorridosExportados,
+    });
+    return Uint8List.fromList(utf8.encode(json));
+  }
+
+  static Future<void> _incluirFoto(Map<String, Object?> fila) async {
+    final fotoPath = fila['foto_path'] as String?;
+    fila['foto_path'] = null;
+    if (fotoPath == null) return;
+
+    final file = File(fotoPath);
+    if (!await file.exists()) {
+      throw FileSystemException(
+        'No se encontro una evidencia guardada',
+        fotoPath,
+      );
+    }
+    fila['foto_file_name'] = path.basename(fotoPath);
+    fila['foto_base64'] = base64Encode(await file.readAsBytes());
+  }
+
+  static ResumenTransferenciaPlantacion previsualizar(Uint8List bytes) {
+    final root = _decodificar(bytes);
+    final proyecto = _mapa(root['project'], 'plantación');
+    final nombre = proyecto['nombre'];
+    if (nombre is! String || nombre.trim().isEmpty) {
+      throw const FormatException(
+        'El archivo no contiene un nombre de plantación válido.',
+      );
+    }
+    final recorridos = root['routes'];
+    if (recorridos is! List) {
+      throw const FormatException(
+        'El archivo no contiene una lista válida de recorridos.',
+      );
+    }
+    var totalPuntos = 0;
+    for (final entrada in recorridos) {
+      final grupo = _mapa(entrada, 'recorrido');
+      _mapa(grupo['recorrido'], 'datos del recorrido');
+      final puntos = grupo['puntos'];
+      if (puntos is! List) {
+        throw const FormatException(
+          'Un recorrido contiene una lista de puntos inválida.',
+        );
+      }
+      totalPuntos += puntos.length;
+      for (final punto in puntos) {
+        _validarPunto(_mapa(punto, 'punto'));
+      }
+    }
+    return ResumenTransferenciaPlantacion(
+      nombre: nombre,
+      cantidadRecorridos: recorridos.length,
+      cantidadPuntos: totalPuntos,
+    );
+  }
+
+  static Future<int> importar(Uint8List bytes) async {
+    previsualizar(bytes);
+    final root = _decodificar(bytes);
+    final proyectoOrigen = _mapa(root['project'], 'plantación');
+    final grupos = (root['routes'] as List)
+        .map((entrada) => _mapa(entrada, 'recorrido'))
+        .toList();
+    final fotosCreadas = <File>[];
+    var contadorFoto = 0;
+
+    Future<String?> restaurarFoto(Map<String, Object?> fila) async {
+      final encoded = fila['foto_base64'];
+      if (encoded == null) return null;
+      if (encoded is! String || encoded.isEmpty) {
+        throw const FormatException('Una evidencia fotográfica está dañada.');
+      }
+      final bytesFoto = base64Decode(encoded);
+      final nombreOrigen = fila['foto_file_name'] as String? ?? '';
+      final extensionOrigen = path.extension(nombreOrigen);
+      final extension =
+          RegExp(r'^\.[A-Za-z0-9]{1,8}$').hasMatch(extensionOrigen)
+          ? extensionOrigen.toLowerCase()
+          : '.bin';
+      final directorio = Directory(
+        path.join(
+          (await getApplicationDocumentsDirectory()).path,
+          'evidencias_importadas',
+        ),
+      );
+      await directorio.create(recursive: true);
+      contadorFoto++;
+      final archivo = File(
+        path.join(
+          directorio.path,
+          'evidencia_${DateTime.now().microsecondsSinceEpoch}_$contadorFoto$extension',
+        ),
+      );
+      await archivo.writeAsBytes(bytesFoto, flush: true);
+      fotosCreadas.add(archivo);
+      return archivo.path;
+    }
+
+    try {
+      final proyectoFoto = await restaurarFoto(proyectoOrigen);
+      final recorridosPreparados =
+          <
+            ({
+              Map<String, Object?> datos,
+              List<({Map<String, Object?> datos, String? fotoPath})> puntos,
+            })
+          >[];
+      for (final grupo in grupos) {
+        final datosRecorrido = _mapa(grupo['recorrido'], 'datos del recorrido');
+        final estado = datosRecorrido['estado'];
+        if (estado is! String ||
+            !EstadoRecorrido.values.any((item) => item.name == estado)) {
+          throw const FormatException('Un recorrido tiene un estado inválido.');
+        }
+        final puntos = <({Map<String, Object?> datos, String? fotoPath})>[];
+        for (final puntoValue in grupo['puntos'] as List) {
+          final punto = _mapa(puntoValue, 'punto');
+          _validarPunto(punto);
+          puntos.add((datos: punto, fotoPath: await restaurarFoto(punto)));
+        }
+        recorridosPreparados.add((datos: datosRecorrido, puntos: puntos));
+      }
+
+      final database = await PuntosDatabase.database;
+      return await database.transaction((transaction) async {
+        final proyectoId = await transaction.insert('proyectos', {
+          'nombre': proyectoOrigen['nombre'],
+          'descripcion': proyectoOrigen['descripcion'] ?? '',
+          'responsable': proyectoOrigen['responsable'],
+          'estado': proyectoOrigen['estado'] ?? 'Planificado',
+          'latitud': proyectoOrigen['latitud'],
+          'longitud': proyectoOrigen['longitud'],
+          'fecha_inicio': proyectoOrigen['fecha_inicio'],
+          'fecha_fin': proyectoOrigen['fecha_fin'],
+          'foto_path': proyectoFoto,
+          'variedad_palma': proyectoOrigen['variedad_palma'],
+          'cantidad_palmas': proyectoOrigen['cantidad_palmas'],
+        });
+        for (final grupo in recorridosPreparados) {
+          final estadoOrigen = grupo.datos['estado'] as String;
+          final estadoImportado =
+              estadoOrigen == EstadoRecorrido.activo.name ||
+                  estadoOrigen == EstadoRecorrido.pausado.name
+              ? EstadoRecorrido.detenido.name
+              : estadoOrigen;
+          final recorridoId = await transaction.insert('recorridos', {
+            'proyecto_id': proyectoId,
+            'nombre': grupo.datos['nombre'],
+            'estado': estadoImportado,
+            'inicio': grupo.datos['inicio'],
+            'fin': grupo.datos['fin'],
+          });
+          for (final punto in grupo.puntos) {
+            await transaction.insert('recorrido_puntos', {
+              'recorrido_id': recorridoId,
+              'latitud': punto.datos['latitud'],
+              'longitud': punto.datos['longitud'],
+              'altitud': punto.datos['altitud'],
+              'precision': punto.datos['precision'],
+              'fecha': punto.datos['fecha'],
+              'racimos_verdes': punto.datos['racimos_verdes'],
+              'racimos_pintones': punto.datos['racimos_pintones'],
+              'inflorescencias': punto.datos['inflorescencias'],
+              'foto_path': punto.fotoPath,
+              'numero_registro': punto.datos['numero_registro'],
+            });
+          }
+        }
+        return proyectoId;
+      });
+    } catch (_) {
+      for (final file in fotosCreadas) {
+        if (await file.exists()) await file.delete();
+      }
+      rethrow;
+    }
+  }
+
+  static Map<String, Object?> _decodificar(Uint8List bytes) {
+    final decoded = jsonDecode(utf8.decode(bytes));
+    final root = _mapa(decoded, 'archivo');
+    if (root['format'] != _formato || root['version'] != _version) {
+      throw const FormatException(
+        'El archivo no es compatible con esta aplicación.',
+      );
+    }
+    return root;
+  }
+
+  static Map<String, Object?> _mapa(Object? value, String nombre) {
+    if (value is! Map) {
+      throw FormatException('El archivo contiene datos inválidos en $nombre.');
+    }
+    return Map<String, Object?>.from(value);
+  }
+
+  static void _validarPunto(Map<String, Object?> punto) {
+    final latitud = punto['latitud'];
+    final longitud = punto['longitud'];
+    final altitud = punto['altitud'];
+    final precision = punto['precision'];
+    if (latitud is! num ||
+        longitud is! num ||
+        altitud is! num ||
+        precision is! num ||
+        !latitud.isFinite ||
+        !longitud.isFinite ||
+        latitud < -90 ||
+        latitud > 90 ||
+        longitud < -180 ||
+        longitud > 180 ||
+        punto['fecha'] is! String) {
+      throw const FormatException(
+        'El archivo contiene coordenadas o puntos inválidos.',
+      );
+    }
+  }
+}
+
 class ExportadorDatos {
   static Future<void> compartirRecorridoExcel(int recorridoId) async {
     final database = await PuntosDatabase.database;
@@ -1581,6 +1954,7 @@ class _ProyectosPageState extends State<ProyectosPage> {
   bool _cargando = true;
   bool _creando = false;
   bool _abriendoRecorrido = false;
+  bool _transfiriendo = false;
   final Set<int> _plantacionesEnCurso = {};
   final Set<int> _recorridosEnCurso = {};
   String? _error;
@@ -1628,6 +2002,118 @@ class _ProyectosPageState extends State<ProyectosPage> {
   bool get _esDispositivoMovil =>
       defaultTargetPlatform == TargetPlatform.android ||
       defaultTargetPlatform == TargetPlatform.iOS;
+
+  Future<void> _compartirPlantacion(Proyecto proyecto) async {
+    if (_transfiriendo || !mounted) return;
+    setState(() => _transfiriendo = true);
+    try {
+      final bytes = await TransferenciaPlantacion.exportar(proyecto.id);
+      final directorio = await getTemporaryDirectory();
+      final nombreSeguro = proyecto.nombre.trim().replaceAll(
+        RegExp(r'[^A-Za-z0-9_-]+'),
+        '_',
+      );
+      final archivo = File(
+        path.join(
+          directorio.path,
+          'plantacion_${nombreSeguro.isEmpty ? proyecto.id : nombreSeguro}.json',
+        ),
+      );
+      await archivo.writeAsBytes(bytes, flush: true);
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [
+            XFile(
+              archivo.path,
+              mimeType: 'application/json',
+              name: path.basename(archivo.path),
+            ),
+          ],
+          subject: 'Plantación ${proyecto.nombre}',
+          text:
+              'Copia de la plantación y sus recorridos para importar '
+              'en Coordenadas.',
+        ),
+      );
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo compartir la plantación: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _transfiriendo = false);
+    }
+  }
+
+  Future<void> _importarPlantacion() async {
+    if (_transfiriendo || !mounted) return;
+    setState(() => _transfiriendo = true);
+    try {
+      final archivo = await FilePicker.pickFile(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+      );
+      if (archivo == null || !mounted) return;
+      final bytes = await archivo.readAsBytes();
+      if (!mounted) return;
+      final resumen = TransferenciaPlantacion.previsualizar(bytes);
+      final confirmar = await showDialog<bool>(
+        context: context,
+        useRootNavigator: true,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Importar plantación'),
+          content: Text(
+            'Se agregará una copia nueva de "${resumen.nombre}" con '
+            '${resumen.cantidadRecorridos} recorridos y '
+            '${resumen.cantidadPuntos} puntos/registros. '
+            'No se sobrescribirán los datos existentes.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext, rootNavigator: true).pop(false),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext, rootNavigator: true).pop(true),
+              child: const Text('Importar copia'),
+            ),
+          ],
+        ),
+      );
+      if (confirmar != true || !mounted) return;
+      final id = await TransferenciaPlantacion.importar(bytes);
+      await _cargarProyectos();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '"${resumen.nombre}" y sus datos se importaron correctamente.',
+            ),
+            action: SnackBarAction(
+              label: 'Ver',
+              onPressed: () {
+                final imported = _proyectos.where((item) => item.id == id);
+                if (imported.isNotEmpty) {
+                  _abrirRecorrido(imported.first);
+                }
+              },
+            ),
+          ),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo importar la plantación: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _transfiriendo = false);
+    }
+  }
 
   Future<void> _crearProyecto() async {
     if (_creando || !mounted) return;
@@ -1881,6 +2367,11 @@ class _ProyectosPageState extends State<ProyectosPage> {
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
+            tooltip: 'Recibir plantación desde archivo',
+            onPressed: _transfiriendo ? null : _importarPlantacion,
+            icon: const Icon(Icons.file_open),
+          ),
+          IconButton(
             tooltip: 'Nueva plantación',
             onPressed: _esDispositivoMovil && !_creando ? _crearProyecto : null,
             icon: const Icon(Icons.create_new_folder),
@@ -1925,6 +2416,19 @@ class _ProyectosPageState extends State<ProyectosPage> {
                       icon: const Icon(Icons.edit),
                     ),
                     children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                        child: Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton.icon(
+                            onPressed: _transfiriendo
+                                ? null
+                                : () => _compartirPlantacion(proyecto),
+                            icon: const Icon(Icons.share),
+                            label: const Text('Enviar plantación y registros'),
+                          ),
+                        ),
+                      ),
                       if (recorridos.isEmpty)
                         const ListTile(
                           dense: true,
