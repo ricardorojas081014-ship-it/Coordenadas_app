@@ -18,6 +18,24 @@ void main() {
     expect(EsriImageryImageProvider.childRow(requested, 17), 3);
   });
 
+  test('muestra solo etiquetas de ciudades del servicio geográfico', () {
+    final ciudades = CityMapLabel.parseResponse({
+      'features': [
+        {
+          'attributes': {'FID': 462, 'CITY_NAME': 'Cucuta'},
+          'geometry': {'x': -72.503, 'y': 7.891},
+        },
+      ],
+    });
+
+    expect(ciudades, hasLength(1));
+    expect(ciudades.single.name, 'Cucuta');
+    expect(ciudades.single.latitude, 7.891);
+    expect(CityMapLabel.maxPopulationRank(5), isNull);
+    expect(CityMapLabel.maxPopulationRank(7), 3);
+    expect(CityMapLabel.maxPopulationRank(11), 7);
+  });
+
   test('previsualiza una plantación exportada con sus puntos', () {
     final bytes = Uint8List.fromList(
       utf8.encode(

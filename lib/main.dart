@@ -46,9 +46,6 @@ class OfflineTileStore {
   static const String url =
       'https://server.arcgisonline.com/ArcGIS/rest/services/'
       'World_Imagery/MapServer/tile';
-  static const String placeLabelsUrl =
-      'https://server.arcgisonline.com/ArcGIS/rest/services/'
-      'Reference/World_Boundaries_and_Places/MapServer/tile';
 
   static Future<Directory> _root() async {
     final base = await getApplicationDocumentsDirectory();
@@ -128,6 +125,136 @@ class OfflineTileStore {
                 n)
             .floor();
     return [x, y];
+  }
+}
+
+class CityMapLabel {
+  const CityMapLabel({
+    required this.id,
+    required this.name,
+    required this.latitude,
+    required this.longitude,
+  });
+
+  static const String _queryUrl =
+      'https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/'
+      'World_Cities/FeatureServer/0/query';
+
+  final int id;
+  final String name;
+  final double latitude;
+  final double longitude;
+
+  static int? maxPopulationRank(double zoom) {
+    if (zoom < 6) return null;
+    if (zoom < 8) return 3;
+    if (zoom < 10) return 5;
+    if (zoom < 12) return 7;
+    return 10;
+  }
+
+  static Future<List<CityMapLabel>> load({
+    required http.Client client,
+    required LatLngBounds bounds,
+    required double zoom,
+  }) async {
+    final maxRank = maxPopulationRank(zoom);
+    if (maxRank == null) return const [];
+    final uri = Uri.parse(_queryUrl).replace(
+      queryParameters: {
+        'where': 'POP > 0 AND POP_RANK <= $maxRank',
+        'geometry': [
+          bounds.west.toStringAsFixed(5),
+          bounds.south.toStringAsFixed(5),
+          bounds.east.toStringAsFixed(5),
+          bounds.north.toStringAsFixed(5),
+        ].join(','),
+        'geometryType': 'esriGeometryEnvelope',
+        'inSR': '4326',
+        'outFields': 'FID,CITY_NAME',
+        'returnGeometry': 'true',
+        'outSR': '4326',
+        'resultRecordCount': '500',
+        'f': 'json',
+      },
+    );
+    final response = await client.get(uri).timeout(const Duration(seconds: 15));
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(
+        'El servicio de nombres de ciudades respondió '
+        'HTTP ${response.statusCode}.',
+        uri: uri,
+      );
+    }
+    final decoded = jsonDecode(response.body);
+    return parseResponse(decoded);
+  }
+
+  static List<CityMapLabel> parseResponse(Object? decoded) {
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException(
+        'El servicio de nombres de ciudades devolvió una respuesta inválida.',
+      );
+    }
+    final error = decoded['error'];
+    if (error != null) {
+      throw FormatException(
+        'No se pudieron cargar los nombres de ciudades: '
+        '${error is Map ? error['message'] : error}',
+      );
+    }
+    final features = decoded['features'];
+    if (features is! List) {
+      throw const FormatException(
+        'La respuesta del servicio de ciudades no contiene lugares.',
+      );
+    }
+    final labels = <CityMapLabel>[];
+    for (final feature in features) {
+      if (feature is! Map<String, dynamic> ||
+          feature['attributes'] is! Map<String, dynamic> ||
+          feature['geometry'] is! Map<String, dynamic>) {
+        continue;
+      }
+      labels.add(
+        _parse(
+          feature['attributes'] as Map<String, dynamic>,
+          feature['geometry'] as Map<String, dynamic>,
+        ),
+      );
+    }
+    return labels;
+  }
+
+  static CityMapLabel _parse(
+    Map<String, dynamic> attributes,
+    Map<String, dynamic> geometry,
+  ) {
+    final id = attributes['FID'];
+    final name = attributes['CITY_NAME'];
+    final latitude = geometry['y'];
+    final longitude = geometry['x'];
+    if (id is! num ||
+        name is! String ||
+        name.trim().isEmpty ||
+        latitude is! num ||
+        longitude is! num ||
+        !latitude.toDouble().isFinite ||
+        !longitude.toDouble().isFinite ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180) {
+      throw const FormatException(
+        'El servicio de ciudades devolvió un lugar inválido.',
+      );
+    }
+    return CityMapLabel(
+      id: id.toInt(),
+      name: name.trim(),
+      latitude: latitude.toDouble(),
+      longitude: longitude.toDouble(),
+    );
   }
 }
 
@@ -361,6 +488,12 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
   bool _disposed = false;
   String? _error;
   Timer? _temporizadorCamara;
+  Timer? _temporizadorCiudades;
+  final http.Client _clienteCiudades = http.Client();
+  List<CityMapLabel> _ciudades = [];
+  String? _consultaCiudadesActual;
+  int _solicitudCiudades = 0;
+  bool _avisoCiudadesMostrado = false;
 
   @override
   void initState() {
@@ -374,6 +507,8 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
   void dispose() {
     _disposed = true;
     _temporizadorCamara?.cancel();
+    _temporizadorCiudades?.cancel();
+    _clienteCiudades.close();
     final subscription = _suscripcionUbicacion;
     _suscripcionUbicacion = null;
     unawaited(subscription?.cancel());
@@ -471,7 +606,76 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
   void _actualizarVistaMapa(MapCamera camera, bool hasGesture) {
     if (!mounted || _disposed) return;
     _programarActualizacionCamara(camera.zoom, camera.center.latitude);
+    _programarCargaCiudades(camera);
   }
+
+  void _programarCargaCiudades(MapCamera camera) {
+    _temporizadorCiudades?.cancel();
+    _temporizadorCiudades = Timer(const Duration(milliseconds: 450), () {
+      unawaited(_cargarCiudades(camera));
+    });
+  }
+
+  Future<void> _cargarCiudades(MapCamera camera) async {
+    if (!mounted || _disposed) return;
+    if (CityMapLabel.maxPopulationRank(camera.zoom) == null) {
+      _consultaCiudadesActual = null;
+      _solicitudCiudades++;
+      if (_ciudades.isNotEmpty) setState(() => _ciudades = []);
+      return;
+    }
+    final bounds = camera.visibleBounds;
+    final consulta = [
+      bounds.west.toStringAsFixed(3),
+      bounds.south.toStringAsFixed(3),
+      bounds.east.toStringAsFixed(3),
+      bounds.north.toStringAsFixed(3),
+      CityMapLabel.maxPopulationRank(camera.zoom),
+    ].join(',');
+    if (_consultaCiudadesActual == consulta) return;
+    _consultaCiudadesActual = consulta;
+    final solicitud = ++_solicitudCiudades;
+    try {
+      final ciudades = await CityMapLabel.load(
+        client: _clienteCiudades,
+        bounds: bounds,
+        zoom: camera.zoom,
+      );
+      if (!mounted || _disposed || solicitud != _solicitudCiudades) return;
+      setState(() => _ciudades = ciudades);
+    } catch (error) {
+      if (!mounted || _disposed || solicitud != _solicitudCiudades) return;
+      _consultaCiudadesActual = null;
+      if (!_avisoCiudadesMostrado) {
+        _avisoCiudadesMostrado = true;
+        _mostrarAviso('No se pudieron cargar los nombres de ciudades: $error');
+      }
+    }
+  }
+
+  Marker _marcadorCiudad(CityMapLabel ciudad) => Marker(
+    point: LatLng(ciudad.latitude, ciudad.longitude),
+    width: 150,
+    height: 28,
+    alignment: Alignment.center,
+    child: IgnorePointer(
+      child: Text(
+        ciudad.name,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        textAlign: TextAlign.center,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+          shadows: [
+            Shadow(color: Colors.black, blurRadius: 3),
+            Shadow(color: Colors.black, blurRadius: 5),
+          ],
+        ),
+      ),
+    ),
+  );
 
   void _programarActualizacionCamara(double zoom, double latitud) {
     _temporizadorCamara?.cancel();
@@ -716,6 +920,8 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                       initialZoom: posicion == null ? 6 : 17,
                       maxZoom: 24,
                       backgroundColor: const Color(0xFF53624F),
+                      onMapReady: () =>
+                          _programarCargaCiudades(_mapController.camera),
                       onPositionChanged: _actualizarVistaMapa,
                       onTap: _seleccionarCoordenada,
                     ),
@@ -726,11 +932,8 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                         maxNativeZoom: 23,
                         tileProvider: EsriImageryTileProvider(),
                       ),
-                      TileLayer(
-                        urlTemplate:
-                            '${OfflineTileStore.placeLabelsUrl}/{z}/{y}/{x}',
-                        userAgentPackageName: 'com.example.coordenadas_app',
-                        maxNativeZoom: 23,
+                      MarkerLayer(
+                        markers: _ciudades.map(_marcadorCiudad).toList(),
                       ),
                       MarkerLayer(
                         markers: _plantaciones
@@ -856,9 +1059,8 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                         attributions: [
                           TextSourceAttribution(
                             'Source: Esri, Vantor, Earthstar Geographics, '
-                            'and the GIS User Community. Place labels: Esri, '
-                            'HERE, Garmin, OpenStreetMap contributors, and '
-                            'the GIS user community.',
+                            'and the GIS User Community. City names: Esri '
+                            'World Cities data.',
                           ),
                         ],
                       ),
@@ -2770,6 +2972,12 @@ class _RecorridosPageState extends State<RecorridosPage>
   bool _disposed = false;
   String? _error;
   Timer? _temporizadorCamara;
+  Timer? _temporizadorCiudades;
+  final http.Client _clienteCiudades = http.Client();
+  List<CityMapLabel> _ciudades = [];
+  String? _consultaCiudadesActual;
+  int _solicitudCiudades = 0;
+  bool _avisoCiudadesMostrado = false;
 
   @override
   void initState() {
@@ -2783,6 +2991,8 @@ class _RecorridosPageState extends State<RecorridosPage>
   void dispose() {
     _disposed = true;
     _temporizadorCamara?.cancel();
+    _temporizadorCiudades?.cancel();
+    _clienteCiudades.close();
     WidgetsBinding.instance.removeObserver(this);
     final subscription = _suscripcion;
     _suscripcion = null;
@@ -3206,7 +3416,76 @@ class _RecorridosPageState extends State<RecorridosPage>
   void _actualizarVistaMapa(MapCamera camera, bool hasGesture) {
     if (!mounted || _disposed) return;
     _programarActualizacionCamara(camera.zoom, camera.center.latitude);
+    _programarCargaCiudades(camera);
   }
+
+  void _programarCargaCiudades(MapCamera camera) {
+    _temporizadorCiudades?.cancel();
+    _temporizadorCiudades = Timer(const Duration(milliseconds: 450), () {
+      unawaited(_cargarCiudades(camera));
+    });
+  }
+
+  Future<void> _cargarCiudades(MapCamera camera) async {
+    if (!mounted || _disposed) return;
+    if (CityMapLabel.maxPopulationRank(camera.zoom) == null) {
+      _consultaCiudadesActual = null;
+      _solicitudCiudades++;
+      if (_ciudades.isNotEmpty) setState(() => _ciudades = []);
+      return;
+    }
+    final bounds = camera.visibleBounds;
+    final consulta = [
+      bounds.west.toStringAsFixed(3),
+      bounds.south.toStringAsFixed(3),
+      bounds.east.toStringAsFixed(3),
+      bounds.north.toStringAsFixed(3),
+      CityMapLabel.maxPopulationRank(camera.zoom),
+    ].join(',');
+    if (_consultaCiudadesActual == consulta) return;
+    _consultaCiudadesActual = consulta;
+    final solicitud = ++_solicitudCiudades;
+    try {
+      final ciudades = await CityMapLabel.load(
+        client: _clienteCiudades,
+        bounds: bounds,
+        zoom: camera.zoom,
+      );
+      if (!mounted || _disposed || solicitud != _solicitudCiudades) return;
+      setState(() => _ciudades = ciudades);
+    } catch (error) {
+      if (!mounted || _disposed || solicitud != _solicitudCiudades) return;
+      _consultaCiudadesActual = null;
+      if (!_avisoCiudadesMostrado) {
+        _avisoCiudadesMostrado = true;
+        _mostrarAviso('No se pudieron cargar los nombres de ciudades: $error');
+      }
+    }
+  }
+
+  Marker _marcadorCiudad(CityMapLabel ciudad) => Marker(
+    point: LatLng(ciudad.latitude, ciudad.longitude),
+    width: 150,
+    height: 28,
+    alignment: Alignment.center,
+    child: IgnorePointer(
+      child: Text(
+        ciudad.name,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        textAlign: TextAlign.center,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+          shadows: [
+            Shadow(color: Colors.black, blurRadius: 3),
+            Shadow(color: Colors.black, blurRadius: 5),
+          ],
+        ),
+      ),
+    ),
+  );
 
   void _programarActualizacionCamara(double zoom, double latitud) {
     _temporizadorCamara?.cancel();
@@ -3423,6 +3702,8 @@ class _RecorridosPageState extends State<RecorridosPage>
                           initialZoom: 6,
                           maxZoom: 24,
                           backgroundColor: const Color(0xFF53624F),
+                          onMapReady: () =>
+                              _programarCargaCiudades(_mapController.camera),
                           onPositionChanged: _actualizarVistaMapa,
                           onTap: _seleccionarCoordenada,
                         ),
@@ -3433,11 +3714,8 @@ class _RecorridosPageState extends State<RecorridosPage>
                             maxNativeZoom: 23,
                             tileProvider: EsriImageryTileProvider(),
                           ),
-                          TileLayer(
-                            urlTemplate:
-                                '${OfflineTileStore.placeLabelsUrl}/{z}/{y}/{x}',
-                            userAgentPackageName: 'com.example.coordenadas_app',
-                            maxNativeZoom: 23,
+                          MarkerLayer(
+                            markers: _ciudades.map(_marcadorCiudad).toList(),
                           ),
                           if (_ruta.length >= 2)
                             PolylineLayer(
@@ -3558,9 +3836,8 @@ class _RecorridosPageState extends State<RecorridosPage>
                             attributions: [
                               TextSourceAttribution(
                                 'Source: Esri, Vantor, Earthstar Geographics, '
-                                'and the GIS User Community. Place labels: '
-                                'Esri, HERE, Garmin, OpenStreetMap contributors, '
-                                'and the GIS user community.',
+                                'and the GIS User Community. City names: Esri '
+                                'World Cities data.',
                               ),
                             ],
                           ),

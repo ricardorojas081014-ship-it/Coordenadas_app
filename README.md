@@ -7,9 +7,9 @@ Aplicación Flutter para registrar plantaciones, ubicaciones y recorridos.
 Los mapas principal y de recorridos usan **Esri World Imagery**, sin requerir
 clave de API. La descarga de zonas guarda los mosaicos para uso sin conexión y
 conserva las descargas anteriores en el mismo directorio de caché. Una capa
-transparente de referencia de Esri añade nombres de pueblos, ciudades, lugares
-y límites sobre las imágenes; las etiquetas se cargan por internet y no forman
-parte de los mosaicos descargados para uso sin conexión.
+de datos separada muestra únicamente nombres de ciudades; no superpone
+carreteras ni nombres de vías. Esos nombres se solicitan al servicio Esri World
+Cities al mover o acercar el mapa, y no están disponibles sin conexión.
 
 La capa satelital prueba la tesela nativa para cada área hasta zoom 23. Si Esri
 responde que no hay imagen disponible, la app baja nivel por nivel hasta hallar
@@ -21,8 +21,8 @@ puede pixelarse. La capa de nombres se carga separadamente para que las
 etiquetas permanezcan legibles.
 
 La atribución se muestra en el mapa: **Source: Esri, Vantor, Earthstar
-Geographics, and the GIS User Community**; las etiquetas atribuyen a **Esri,
-HERE, Garmin, OpenStreetMap contributors, and the GIS user community**.
+Geographics, and the GIS User Community**; los nombres de ciudades provienen
+del servicio **Esri World Cities**.
 Consulta los términos de Esri para los usos y la redistribución de la
 cartografía.
 
