@@ -128,6 +128,34 @@ class OfflineTileStore {
   }
 }
 
+class MapCoordinateInput {
+  static LatLng parse(String input) {
+    final values = input.trim().split(RegExp(r'[,;\s]+'));
+    if (values.length != 2) {
+      throw const FormatException(
+        'Ingresa latitud y longitud en una sola línea, por ejemplo: 7.89, -72.50.',
+      );
+    }
+
+    final latitude = double.tryParse(values[0]);
+    final longitude = double.tryParse(values[1]);
+    if (latitude == null ||
+        longitude == null ||
+        !latitude.isFinite ||
+        !longitude.isFinite ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180) {
+      throw const FormatException(
+        'Ingresa coordenadas válidas. Latitud: -90 a 90; longitud: -180 a 180.',
+      );
+    }
+
+    return LatLng(latitude, longitude);
+  }
+}
+
 class CityMapLabel {
   const CityMapLabel({
     required this.id,
@@ -316,6 +344,11 @@ class EsriImageryTileProvider extends TileProvider {
     final directory = await OfflineTileStore._root();
     _directoryPath = directory.path;
   }
+
+  static Future<String> ensurePrepared() async {
+    if (_directoryPath.isEmpty) await prepare();
+    return _directoryPath;
+  }
 }
 
 class EsriImageryImageProvider extends ImageProvider<EsriImageryImageProvider> {
@@ -380,21 +413,52 @@ class EsriImageryImageProvider extends ImageProvider<EsriImageryImageProvider> {
     EsriImageryImageProvider key,
     ImageDecoderCallback decode,
   ) async {
-    final bytes = await key._loadBestAvailableTile();
+    final bytes = await key.loadBestAvailableTile();
     final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
     return decode(buffer);
   }
 
-  Future<Uint8List> _loadBestAvailableTile() async {
+  @visibleForTesting
+  Future<Uint8List> loadBestAvailableTile() async {
+    var offlineDirectoryPath = directoryPath;
+    if (coordinates.z >= OfflineTileStore.zoom &&
+        offlineDirectoryPath.isEmpty) {
+      offlineDirectoryPath = await EsriImageryTileProvider.ensurePrepared();
+    }
+    if (coordinates.z >= OfflineTileStore.zoom) {
+      final offlineCoordinates = ancestorCoordinates(
+        coordinates,
+        OfflineTileStore.zoom,
+      );
+      final offlineTile = File(
+        path.join(
+          offlineDirectoryPath,
+          '${OfflineTileStore.zoom}',
+          '${offlineCoordinates.x}',
+          '${offlineCoordinates.y}.png',
+        ),
+      );
+      if (await offlineTile.exists()) {
+        final bytes = await offlineTile.readAsBytes();
+        if (hasImagery(bytes)) {
+          if (coordinates.z == OfflineTileStore.zoom) return bytes;
+          return _cropAncestorTile(
+            bytes: bytes,
+            sourceZoom: OfflineTileStore.zoom,
+          );
+        }
+      }
+    }
+
     for (var zoom = coordinates.z; zoom >= 0; zoom--) {
       final sourceTile = ancestorCoordinates(coordinates, zoom);
       final x = sourceTile.x;
       final y = sourceTile.y;
       final Uint8List? bytes;
 
-      if (zoom == OfflineTileStore.zoom && directoryPath.isNotEmpty) {
+      if (zoom == OfflineTileStore.zoom && offlineDirectoryPath.isNotEmpty) {
         final cachedTile = File(
-          path.join(directoryPath, '$zoom', '$x', '$y.png'),
+          path.join(offlineDirectoryPath, '$zoom', '$x', '$y.png'),
         );
         if (await cachedTile.exists()) {
           bytes = await cachedTile.readAsBytes();
@@ -701,21 +765,114 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
     setState(() => _coordenadaSeleccionada = punto);
   }
 
+  Future<LatLng?> _ingresarCoordenadasDescarga() async {
+    final coordenadasController = TextEditingController();
+    try {
+      return await showDialog<LatLng>(
+        context: context,
+        builder: (dialogContext) {
+          var error = '';
+          return StatefulBuilder(
+            builder: (dialogContext, setDialogState) => AlertDialog(
+              title: const Text('Coordenadas del centro'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    autofocus: true,
+                    controller: coordenadasController,
+                    keyboardType: TextInputType.text,
+                    decoration: const InputDecoration(
+                      labelText: 'Latitud, longitud',
+                      hintText: 'Ej. 7.89, -72.50',
+                    ),
+                  ),
+                  if (error.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text(
+                        error,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Cancelar'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    try {
+                      Navigator.pop(
+                        dialogContext,
+                        MapCoordinateInput.parse(coordenadasController.text),
+                      );
+                    } on FormatException catch (exception) {
+                      setDialogState(() => error = exception.message);
+                    }
+                  },
+                  child: const Text('Usar coordenadas'),
+                ),
+              ],
+            ),
+          );
+        },
+      );
+    } finally {
+      coordenadasController.dispose();
+    }
+  }
+
   Future<void> _descargarZona() async {
-    final posicion = _posicion;
-    if (posicion == null || !mounted || _descargandoZonaActiva) return;
+    if (!mounted || _descargandoZonaActiva) return;
+    final gpsPosition = _posicion;
+    final centro = await showDialog<LatLng>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('Elegir centro de descarga'),
+        children: [
+          if (_coordenadaSeleccionada != null)
+            SimpleDialogOption(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, _coordenadaSeleccionada),
+              child: const Text('Usar el punto marcado en el mapa'),
+            ),
+          if (gpsPosition != null)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(
+                dialogContext,
+                LatLng(gpsPosition.latitude, gpsPosition.longitude),
+              ),
+              child: const Text('Usar mi ubicación actual'),
+            ),
+          SimpleDialogOption(
+            onPressed: () async {
+              final point = await _ingresarCoordenadasDescarga();
+              if (point != null && dialogContext.mounted) {
+                Navigator.pop(dialogContext, point);
+              }
+            },
+            child: const Text('Ingresar coordenadas'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || centro == null) return;
+
     final area = await showDialog<double>(
       context: context,
       useRootNavigator: true,
       builder: (dialogContext) => SimpleDialog(
-        title: const Text('Descargar zona satelital'),
+        title: const Text('Tamaño de la zona'),
         children: [
           const Padding(
             padding: EdgeInsets.fromLTRB(24, 0, 24, 8),
-            child: Text(
-              'Se descargara un cuadrado centrado en tu ubicacion. '
-              'Hazlo antes de entrar a una zona sin senal.',
-            ),
+            child: Text('Se descargará un cuadrado alrededor del centro.'),
           ),
           for (final km2 in [1.0, 4.0, 9.0, 16.0])
             SimpleDialogOption(
@@ -757,7 +914,7 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
     );
     try {
       final saved = await OfflineTileStore.download(
-        center: LatLng(posicion.latitude, posicion.longitude),
+        center: centro,
         areaKm2: area,
         onProgress: (completed, count) {
           progreso = completed;
@@ -821,40 +978,14 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
               ),
               FilledButton(
                 onPressed: () {
-                  final entrada = coordenadasTexto.trim();
-                  final List<String> valores;
-                  if (entrada.contains(';')) {
-                    valores = entrada.split(';');
-                  } else if (entrada.contains(',')) {
-                    valores = entrada.split(',');
-                  } else {
-                    valores = entrada.split(RegExp(r'\s+'));
+                  try {
+                    Navigator.of(
+                      dialogContext,
+                      rootNavigator: true,
+                    ).pop(MapCoordinateInput.parse(coordenadasTexto));
+                  } on FormatException catch (exception) {
+                    setDialogState(() => error = exception.message);
                   }
-                  final latitud = valores.length == 2
-                      ? double.tryParse(valores[0].trim().replaceAll(',', '.'))
-                      : null;
-                  final longitud = valores.length == 2
-                      ? double.tryParse(valores[1].trim().replaceAll(',', '.'))
-                      : null;
-                  if (latitud == null ||
-                      longitud == null ||
-                      !latitud.isFinite ||
-                      !longitud.isFinite ||
-                      latitud < -90 ||
-                      latitud > 90 ||
-                      longitud < -180 ||
-                      longitud > 180) {
-                    setDialogState(
-                      () => error =
-                          'Ingresa latitud y longitud, separadas por coma, punto y coma o espacio. '
-                          'Latitud: -90 a 90; longitud: -180 a 180.',
-                    );
-                    return;
-                  }
-                  Navigator.of(
-                    dialogContext,
-                    rootNavigator: true,
-                  ).pop(LatLng(latitud, longitud));
                 },
                 child: const Text('Ubicar'),
               ),
@@ -889,9 +1020,7 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
           ),
           IconButton(
             tooltip: 'Descargar zona para uso offline',
-            onPressed: _posicion == null || _descargandoZonaActiva
-                ? null
-                : _descargarZona,
+            onPressed: _descargandoZonaActiva ? null : _descargarZona,
             icon: const Icon(Icons.download_for_offline),
           ),
           IconButton(

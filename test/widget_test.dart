@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -18,6 +20,49 @@ void main() {
     expect(EsriImageryImageProvider.childRow(requested, 17), 3);
   });
 
+  test(
+    'usa el mosaico guardado al acercar sin pedir una tesela en línea',
+    () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'coordenadas_offline_tiles_',
+      );
+      ui.Image? image;
+      ui.Picture? picture;
+      try {
+        final recorder = ui.PictureRecorder();
+        final canvas = ui.Canvas(recorder);
+        canvas.drawRect(
+          const ui.Rect.fromLTWH(0, 0, 256, 256),
+          ui.Paint()..color = const ui.Color(0xFF4A6B39),
+        );
+        picture = recorder.endRecording();
+        image = await picture.toImage(256, 256);
+        final png = await image.toByteData(format: ui.ImageByteFormat.png);
+        final tile = File(
+          '${directory.path}${Platform.pathSeparator}17'
+          '${Platform.pathSeparator}12345${Platform.pathSeparator}23459.png',
+        );
+        await tile.parent.create(recursive: true);
+        await tile.writeAsBytes(png!.buffer.asUint8List());
+
+        final provider = EsriImageryImageProvider(
+          coordinates: const TileCoordinates(24690, 46918, 18),
+          directoryPath: directory.path,
+          requestTile: (zoom, x, y) async {
+            throw StateError('No debería solicitar mosaicos en línea.');
+          },
+        );
+        final result = await provider.loadBestAvailableTile();
+
+        expect(result, isNotEmpty);
+      } finally {
+        image?.dispose();
+        picture?.dispose();
+        await directory.delete(recursive: true);
+      }
+    },
+  );
+
   test('muestra solo etiquetas de ciudades del servicio geográfico', () {
     final ciudades = CityMapLabel.parseResponse({
       'features': [
@@ -34,6 +79,14 @@ void main() {
     expect(CityMapLabel.maxPopulationRank(5), isNull);
     expect(CityMapLabel.maxPopulationRank(7), 3);
     expect(CityMapLabel.maxPopulationRank(11), 7);
+  });
+
+  test('interpreta coordenadas ingresadas en una sola línea', () {
+    final point = MapCoordinateInput.parse('7.89, -72.50');
+
+    expect(point.latitude, 7.89);
+    expect(point.longitude, -72.5);
+    expect(() => MapCoordinateInput.parse('91, -72.50'), throwsFormatException);
   });
 
   test('previsualiza una plantación exportada con sus puntos', () {
