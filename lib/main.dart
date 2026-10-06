@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:crypto/crypto.dart';
 import 'package:excel/excel.dart' hide Border;
 import 'package:file_picker/file_picker.dart';
 import 'package:geolocator/geolocator.dart';
@@ -45,6 +46,9 @@ class OfflineTileStore {
   static const String url =
       'https://server.arcgisonline.com/ArcGIS/rest/services/'
       'World_Imagery/MapServer/tile';
+  static const String placeLabelsUrl =
+      'https://server.arcgisonline.com/ArcGIS/rest/services/'
+      'Reference/World_Boundaries_and_Places/MapServer/tile';
 
   static Future<Directory> _root() async {
     final base = await getApplicationDocumentsDirectory();
@@ -95,7 +99,9 @@ class OfflineTileStore {
         final target = File(await tilePath(x, y));
         if (!await target.exists()) {
           final response = await http.get(Uri.parse(_url(x, y)));
-          if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+          if (response.statusCode == 200 &&
+              response.bodyBytes.isNotEmpty &&
+              EsriImageryImageProvider.hasImagery(response.bodyBytes)) {
             await target.writeAsBytes(response.bodyBytes, flush: true);
             saved++;
           }
@@ -125,30 +131,56 @@ class OfflineTileStore {
   }
 }
 
-class OfflineTileProvider extends TileProvider {
+class EsriImageryTileProvider extends TileProvider {
+  final http.Client _client = http.Client();
+  final Map<String, Future<Uint8List?>> _tileCache = {};
+
   @override
   ImageProvider getImage(TileCoordinates coordinates, TileLayer options) {
-    final factor = coordinates.z > OfflineTileStore.zoom
-        ? math.pow(2, coordinates.z - OfflineTileStore.zoom).toInt()
-        : 1;
-    final x = coordinates.z > OfflineTileStore.zoom
-        ? coordinates.x ~/ factor
-        : coordinates.x;
-    final y = coordinates.z > OfflineTileStore.zoom
-        ? coordinates.y ~/ factor
-        : coordinates.y;
-    final localZoom = coordinates.z >= OfflineTileStore.zoom
-        ? OfflineTileStore.zoom
-        : coordinates.z;
-    final file = File(path.join(_directoryPath, '$localZoom', '$x', '$y.png'));
-    if (_directoryPath.isNotEmpty && file.existsSync()) {
-      return FileImage(file);
-    }
-    return NetworkImage(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/'
-      'World_Imagery/MapServer/tile/${coordinates.z}/'
-      '${coordinates.y}/${coordinates.x}',
+    return EsriImageryImageProvider(
+      coordinates: coordinates,
+      directoryPath: _directoryPath,
+      requestTile: _requestTile,
     );
+  }
+
+  Future<Uint8List?> _requestTile(int zoom, int x, int y) async {
+    final key = '$zoom/$y/$x';
+    final request = _tileCache.putIfAbsent(key, () async {
+      final response = await _client.get(
+        Uri.parse('${OfflineTileStore.url}/$zoom/$y/$x'),
+        headers: headers,
+      );
+      if (response.statusCode == HttpStatus.notFound) return null;
+      if (response.statusCode != HttpStatus.ok) {
+        throw HttpException(
+          'Esri respondió HTTP ${response.statusCode} al cargar una tesela.',
+          uri: response.request?.url,
+        );
+      }
+      if (response.bodyBytes.isEmpty) {
+        throw FormatException('Esri devolvió una tesela vacía en zoom $zoom.');
+      }
+      return response.bodyBytes;
+    });
+
+    try {
+      final bytes = await request;
+      if (_tileCache.length > 256) {
+        _tileCache.remove(_tileCache.keys.first);
+      }
+      return bytes;
+    } catch (error, stackTrace) {
+      _tileCache.remove(key);
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  @override
+  void dispose() {
+    _tileCache.clear();
+    _client.close();
+    super.dispose();
   }
 
   static String _directoryPath = '';
@@ -157,6 +189,153 @@ class OfflineTileProvider extends TileProvider {
     final directory = await OfflineTileStore._root();
     _directoryPath = directory.path;
   }
+}
+
+class EsriImageryImageProvider extends ImageProvider<EsriImageryImageProvider> {
+  const EsriImageryImageProvider({
+    required this.coordinates,
+    required this.directoryPath,
+    required this.requestTile,
+  });
+
+  // ArcGIS returns this same placeholder image with HTTP 200 for empty tiles.
+  static const String _noDataTileSha256 =
+      '9eafd300d61393184a4abc1d458564cfd1cd9b6f9c4e9c74687045c0a0e5b858';
+
+  static bool hasImagery(Uint8List bytes) =>
+      sha256.convert(bytes).toString() != _noDataTileSha256;
+
+  final TileCoordinates coordinates;
+  final String directoryPath;
+  final Future<Uint8List?> Function(int zoom, int x, int y) requestTile;
+
+  @visibleForTesting
+  static TileCoordinates ancestorCoordinates(
+    TileCoordinates coordinates,
+    int zoom,
+  ) {
+    if (zoom < 0 || zoom > coordinates.z) {
+      throw RangeError.range(zoom, 0, coordinates.z, 'zoom');
+    }
+    final factor = 1 << (coordinates.z - zoom);
+    return TileCoordinates(
+      coordinates.x ~/ factor,
+      coordinates.y ~/ factor,
+      zoom,
+    );
+  }
+
+  @visibleForTesting
+  static int childColumn(TileCoordinates coordinates, int ancestorZoom) =>
+      coordinates.x % (1 << (coordinates.z - ancestorZoom));
+
+  @visibleForTesting
+  static int childRow(TileCoordinates coordinates, int ancestorZoom) =>
+      coordinates.y % (1 << (coordinates.z - ancestorZoom));
+
+  @override
+  Future<EsriImageryImageProvider> obtainKey(
+    ImageConfiguration configuration,
+  ) => SynchronousFuture<EsriImageryImageProvider>(this);
+
+  @override
+  ImageStreamCompleter loadImage(
+    EsriImageryImageProvider key,
+    ImageDecoderCallback decode,
+  ) => MultiFrameImageStreamCompleter(
+    codec: _loadImage(key, decode),
+    scale: 1,
+    debugLabel:
+        'Esri imagery tile ${coordinates.z}/${coordinates.y}/${coordinates.x}',
+  );
+
+  Future<ui.Codec> _loadImage(
+    EsriImageryImageProvider key,
+    ImageDecoderCallback decode,
+  ) async {
+    final bytes = await key._loadBestAvailableTile();
+    final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+    return decode(buffer);
+  }
+
+  Future<Uint8List> _loadBestAvailableTile() async {
+    for (var zoom = coordinates.z; zoom >= 0; zoom--) {
+      final sourceTile = ancestorCoordinates(coordinates, zoom);
+      final x = sourceTile.x;
+      final y = sourceTile.y;
+      final Uint8List? bytes;
+
+      if (zoom == OfflineTileStore.zoom && directoryPath.isNotEmpty) {
+        final cachedTile = File(
+          path.join(directoryPath, '$zoom', '$x', '$y.png'),
+        );
+        if (await cachedTile.exists()) {
+          bytes = await cachedTile.readAsBytes();
+        } else {
+          bytes = await requestTile(zoom, x, y);
+        }
+      } else {
+        bytes = await requestTile(zoom, x, y);
+      }
+
+      if (bytes == null) continue;
+      if (!hasImagery(bytes)) continue;
+      if (zoom == coordinates.z) return bytes;
+
+      return _cropAncestorTile(bytes: bytes, sourceZoom: zoom);
+    }
+
+    throw StateError(
+      'Esri no dispone de imágenes para la tesela '
+      '${coordinates.z}/${coordinates.y}/${coordinates.x}.',
+    );
+  }
+
+  Future<Uint8List> _cropAncestorTile({
+    required Uint8List bytes,
+    required int sourceZoom,
+  }) async {
+    final shift = coordinates.z - sourceZoom;
+    final factor = 1 << shift;
+    final column = childColumn(coordinates, sourceZoom);
+    final row = childRow(coordinates, sourceZoom);
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    final image = frame.image;
+    final tileSize = image.width / factor;
+    final sourceRect = ui.Rect.fromLTWH(
+      tileSize * column,
+      tileSize * row,
+      tileSize,
+      tileSize,
+    );
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+    canvas.drawImageRect(
+      image,
+      sourceRect,
+      const ui.Rect.fromLTWH(0, 0, 256, 256),
+      ui.Paint()..filterQuality = ui.FilterQuality.high,
+    );
+    final cropped = await recorder.endRecording().toImage(256, 256);
+    final png = await cropped.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    cropped.dispose();
+    codec.dispose();
+    if (png == null) {
+      throw StateError('No se pudo ampliar la imagen satelital de Esri.');
+    }
+    return png.buffer.asUint8List();
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is EsriImageryImageProvider &&
+      other.coordinates == coordinates &&
+      other.directoryPath == directoryPath;
+
+  @override
+  int get hashCode => Object.hash(coordinates, directoryPath);
 }
 
 class InicioRecorridosPage extends StatefulWidget {
@@ -181,11 +360,12 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
   bool _descargandoZonaActiva = false;
   bool _disposed = false;
   String? _error;
+  Timer? _temporizadorCamara;
 
   @override
   void initState() {
     super.initState();
-    unawaited(OfflineTileProvider.prepare());
+    unawaited(_prepararMosaicosOffline());
     _cargarPlantaciones();
     _obtenerUbicacion();
   }
@@ -193,12 +373,24 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
   @override
   void dispose() {
     _disposed = true;
+    _temporizadorCamara?.cancel();
     final subscription = _suscripcionUbicacion;
     _suscripcionUbicacion = null;
     unawaited(subscription?.cancel());
     unawaited(_suscripcionRumbo?.cancel());
     _suscripcionRumbo = null;
     super.dispose();
+  }
+
+  Future<void> _prepararMosaicosOffline() async {
+    try {
+      await EsriImageryTileProvider.prepare();
+      if (mounted && !_disposed) setState(() {});
+    } catch (error) {
+      if (mounted && !_disposed) {
+        _mostrarAviso('No se pudo preparar la caché del mapa: $error');
+      }
+    }
   }
 
   Future<void> _cargarPlantaciones() async {
@@ -239,7 +431,7 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
       final posicion = await Geolocator.getCurrentPosition();
       if (!mounted || _disposed) return;
       setState(() => _posicion = posicion);
-      _mapController.move(LatLng(posicion.latitude, posicion.longitude), 17);
+      _moverMapa(LatLng(posicion.latitude, posicion.longitude), 17);
       _suscribirseUbicacion();
       _suscribirseBrujula();
     } catch (error) {
@@ -278,13 +470,29 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
 
   void _actualizarVistaMapa(MapCamera camera, bool hasGesture) {
     if (!mounted || _disposed) return;
-    setState(() {
-      _zoomMapa = camera.zoom;
-      _latitudMapa = camera.center.latitude;
+    _programarActualizacionCamara(camera.zoom, camera.center.latitude);
+  }
+
+  void _programarActualizacionCamara(double zoom, double latitud) {
+    _temporizadorCamara?.cancel();
+    _temporizadorCamara = Timer(const Duration(milliseconds: 180), () {
+      if (!mounted || _disposed) return;
+      setState(() {
+        _zoomMapa = zoom;
+        _latitudMapa = latitud;
+      });
     });
   }
 
+  void _moverMapa(LatLng punto, double zoom) {
+    _mapController.move(punto, zoom);
+  }
+
   void _seleccionarCoordenada(TapPosition _, LatLng punto) {
+    _seleccionarPunto(punto);
+  }
+
+  void _seleccionarPunto(LatLng punto) {
     if (!mounted || _disposed) return;
     setState(() => _coordenadaSeleccionada = punto);
   }
@@ -453,7 +661,7 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
     );
     if (!mounted || _disposed || punto == null) return;
     setState(() => _coordenadaSeleccionada = punto);
-    _mapController.move(punto, 19);
+    _moverMapa(punto, 19);
   }
 
   void _mostrarAviso(String mensaje) {
@@ -505,7 +713,7 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                       initialCenter: posicion == null
                           ? const LatLng(4.7110, -74.0721)
                           : LatLng(posicion.latitude, posicion.longitude),
-                      initialZoom: posicion == null ? 6 : 19,
+                      initialZoom: posicion == null ? 6 : 17,
                       maxZoom: 24,
                       backgroundColor: const Color(0xFF53624F),
                       onPositionChanged: _actualizarVistaMapa,
@@ -513,12 +721,16 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                     ),
                     children: [
                       TileLayer(
-                        urlTemplate:
-                            'https://server.arcgisonline.com/ArcGIS/rest/'
-                            'services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                        urlTemplate: '${OfflineTileStore.url}/{z}/{y}/{x}',
                         userAgentPackageName: 'com.example.coordenadas_app',
-                        maxNativeZoom: 17,
-                        tileProvider: OfflineTileProvider(),
+                        maxNativeZoom: 23,
+                        tileProvider: EsriImageryTileProvider(),
+                      ),
+                      TileLayer(
+                        urlTemplate:
+                            '${OfflineTileStore.placeLabelsUrl}/{z}/{y}/{x}',
+                        userAgentPackageName: 'com.example.coordenadas_app',
+                        maxNativeZoom: 23,
                       ),
                       MarkerLayer(
                         markers: _plantaciones
@@ -538,7 +750,7 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                                 height: 38,
                                 alignment: Alignment.center,
                                 child: GestureDetector(
-                                  onTap: () => _mapController.move(punto, 18),
+                                  onTap: () => _moverMapa(punto, 18),
                                   child: Tooltip(
                                     message: 'Plantación: ${plantacion.nombre}',
                                     child: Stack(
@@ -643,7 +855,10 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
                       RichAttributionWidget(
                         attributions: [
                           TextSourceAttribution(
-                            'Esri, Maxar, Earthstar Geographics',
+                            'Source: Esri, Vantor, Earthstar Geographics, '
+                            'and the GIS User Community. Place labels: Esri, '
+                            'HERE, Garmin, OpenStreetMap contributors, and '
+                            'the GIS user community.',
                           ),
                         ],
                       ),
@@ -2554,11 +2769,12 @@ class _RecorridosPageState extends State<RecorridosPage>
   bool _registrandoMuestreo = false;
   bool _disposed = false;
   String? _error;
+  Timer? _temporizadorCamara;
 
   @override
   void initState() {
     super.initState();
-    unawaited(OfflineTileProvider.prepare());
+    unawaited(_prepararMosaicosOffline());
     WidgetsBinding.instance.addObserver(this);
     _cargarRecorridos();
   }
@@ -2566,6 +2782,7 @@ class _RecorridosPageState extends State<RecorridosPage>
   @override
   void dispose() {
     _disposed = true;
+    _temporizadorCamara?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     final subscription = _suscripcion;
     _suscripcion = null;
@@ -2573,6 +2790,17 @@ class _RecorridosPageState extends State<RecorridosPage>
     unawaited(_suscripcionRumbo?.cancel());
     _suscripcionRumbo = null;
     super.dispose();
+  }
+
+  Future<void> _prepararMosaicosOffline() async {
+    try {
+      await EsriImageryTileProvider.prepare();
+      if (mounted && !_disposed) setState(() {});
+    } catch (error) {
+      if (mounted && !_disposed) {
+        _mostrarAviso('No se pudo preparar la caché del mapa: $error');
+      }
+    }
   }
 
   @override
@@ -2620,7 +2848,7 @@ class _RecorridosPageState extends State<RecorridosPage>
       final ultima = _ruta.last;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && !_disposed) {
-          _mapController.move(ultima, 19);
+          _moverMapa(ultima, 19);
         }
       });
     }
@@ -2749,7 +2977,7 @@ class _RecorridosPageState extends State<RecorridosPage>
         posicionInicial.longitude,
       );
       _ruta = [puntoInicial];
-      _mapController.move(puntoInicial, 19);
+      _moverMapa(puntoInicial, 19);
       if (mounted) setState(() {});
       _suscribirUbicacion();
     } catch (error) {
@@ -2947,7 +3175,7 @@ class _RecorridosPageState extends State<RecorridosPage>
               }
             });
             if (!mounted || _disposed) return;
-            _mapController.move(punto, 19);
+            _moverMapa(punto, 19);
           } catch (error) {
             if (mounted && !_disposed) {
               _mostrarAviso('No se pudo guardar la posición: $error');
@@ -2977,10 +3205,22 @@ class _RecorridosPageState extends State<RecorridosPage>
 
   void _actualizarVistaMapa(MapCamera camera, bool hasGesture) {
     if (!mounted || _disposed) return;
-    setState(() {
-      _zoomMapa = camera.zoom;
-      _latitudMapa = camera.center.latitude;
+    _programarActualizacionCamara(camera.zoom, camera.center.latitude);
+  }
+
+  void _programarActualizacionCamara(double zoom, double latitud) {
+    _temporizadorCamara?.cancel();
+    _temporizadorCamara = Timer(const Duration(milliseconds: 180), () {
+      if (!mounted || _disposed) return;
+      setState(() {
+        _zoomMapa = zoom;
+        _latitudMapa = latitud;
+      });
     });
+  }
+
+  void _moverMapa(LatLng punto, double zoom) {
+    _mapController.move(punto, zoom);
   }
 
   void _seleccionarCoordenada(TapPosition _, LatLng punto) {
@@ -3188,12 +3428,16 @@ class _RecorridosPageState extends State<RecorridosPage>
                         ),
                         children: [
                           TileLayer(
-                            urlTemplate:
-                                'https://server.arcgisonline.com/ArcGIS/rest/'
-                                'services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                            urlTemplate: '${OfflineTileStore.url}/{z}/{y}/{x}',
                             userAgentPackageName: 'com.example.coordenadas_app',
-                            maxNativeZoom: 17,
-                            tileProvider: OfflineTileProvider(),
+                            maxNativeZoom: 23,
+                            tileProvider: EsriImageryTileProvider(),
+                          ),
+                          TileLayer(
+                            urlTemplate:
+                                '${OfflineTileStore.placeLabelsUrl}/{z}/{y}/{x}',
+                            userAgentPackageName: 'com.example.coordenadas_app',
+                            maxNativeZoom: 23,
                           ),
                           if (_ruta.length >= 2)
                             PolylineLayer(
@@ -3313,7 +3557,10 @@ class _RecorridosPageState extends State<RecorridosPage>
                           RichAttributionWidget(
                             attributions: [
                               TextSourceAttribution(
-                                'OpenStreetMap contributors',
+                                'Source: Esri, Vantor, Earthstar Geographics, '
+                                'and the GIS User Community. Place labels: '
+                                'Esri, HERE, Garmin, OpenStreetMap contributors, '
+                                'and the GIS user community.',
                               ),
                             ],
                           ),

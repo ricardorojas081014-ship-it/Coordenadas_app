@@ -1,11 +1,23 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:coordenadas_app/main.dart';
 
 void main() {
+  test('calcula la sección correcta de la última tesela con imagen', () {
+    const requested = TileCoordinates(12345, 23459, 19);
+
+    expect(
+      EsriImageryImageProvider.ancestorCoordinates(requested, 17),
+      const TileCoordinates(3086, 5864, 17),
+    );
+    expect(EsriImageryImageProvider.childColumn(requested, 17), 1);
+    expect(EsriImageryImageProvider.childRow(requested, 17), 3);
+  });
+
   test('previsualiza una plantación exportada con sus puntos', () {
     final bytes = Uint8List.fromList(
       utf8.encode(
