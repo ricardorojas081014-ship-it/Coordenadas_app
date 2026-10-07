@@ -1288,16 +1288,21 @@ class _CargandoOperacion extends StatelessWidget {
 }
 
 class _IndicadorVistaMapa extends StatelessWidget {
-  const _IndicadorVistaMapa({required this.zoom, required this.latitud});
+  const _IndicadorVistaMapa({
+    required this.zoom,
+    required this.latitud,
+    this.factorAlturaMapa = 0.42,
+  });
 
   final double zoom;
   final double latitud;
+  final double factorAlturaMapa;
 
   @override
   Widget build(BuildContext context) {
     final metrosPorPixel =
         156543.03392 * math.cos(latitud * math.pi / 180) / math.pow(2, zoom);
-    final altoMapa = MediaQuery.sizeOf(context).height * 0.42;
+    final altoMapa = MediaQuery.sizeOf(context).height * factorAlturaMapa;
     final piesVista = (metrosPorPixel * altoMapa / 2 * 3.28084)
         .clamp(1, double.infinity)
         .round();
@@ -3820,345 +3825,433 @@ class _RecorridosPageState extends State<RecorridosPage>
           ? Center(child: Text(_error!, textAlign: TextAlign.center))
           : Stack(
               children: [
-                Column(
-                  children: [
-                    Expanded(
-                      flex: 3,
-                      child: FlutterMap(
-                        mapController: _mapController,
-                        options: MapOptions(
-                          initialCenter: LatLng(4.7110, -74.0721),
-                          initialZoom: 6,
-                          maxZoom: 24,
-                          backgroundColor: const Color(0xFF53624F),
-                          onMapReady: () =>
-                              _programarCargaCiudades(_mapController.camera),
-                          onPositionChanged: _actualizarVistaMapa,
-                          onTap: _seleccionarCoordenada,
-                        ),
-                        children: [
-                          TileLayer(
-                            urlTemplate: '${OfflineTileStore.url}/{z}/{y}/{x}',
-                            userAgentPackageName: 'com.example.coordenadas_app',
-                            maxNativeZoom: 23,
-                            tileProvider: EsriImageryTileProvider(),
-                          ),
-                          MarkerLayer(
-                            markers: _ciudades.map(_marcadorCiudad).toList(),
-                          ),
-                          if (_ruta.length >= 2)
-                            PolylineLayer(
-                              polylines: [
-                                Polyline(
-                                  points: _ruta,
-                                  color: Colors.blue,
-                                  strokeWidth: 5,
-                                ),
-                              ],
-                            ),
-                          if (_ultimaPosicion != null)
-                            MarkerLayer(
-                              markers: [
-                                Marker(
-                                  point: LatLng(
-                                    _ultimaPosicion!.latitude,
-                                    _ultimaPosicion!.longitude,
-                                  ),
-                                  width: 64,
-                                  height: 64,
-                                  child: _MarcadorUbicacion(
-                                    rumbo: _rumbo ?? _ultimaPosicion!.heading,
-                                    precision: _ultimaPosicion!.accuracy,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          if (_coordenadaSeleccionada != null)
-                            MarkerLayer(
-                              markers: [
-                                Marker(
-                                  point: _coordenadaSeleccionada!,
-                                  width: 42,
-                                  height: 42,
-                                  child: const Icon(
-                                    Icons.add_location_alt,
-                                    color: Colors.red,
-                                    size: 36,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          if (_coordenadaSeleccionada != null)
-                            MarkerLayer(
-                              markers: [
-                                Marker(
-                                  point: _coordenadaSeleccionada!,
-                                  width: 42,
-                                  height: 42,
-                                  child: const Icon(
-                                    Icons.add_location_alt,
-                                    color: Colors.red,
-                                    size: 36,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          MarkerLayer(
-                            markers: _puntosMuestreo.map((punto) {
-                              final latitud = (punto['latitud']! as num)
-                                  .toDouble();
-                              final longitud = (punto['longitud']! as num)
-                                  .toDouble();
-                              final verdes = punto['racimos_verdes'];
-                              final pintones = punto['racimos_pintones'];
-                              final inflorescencias = punto['inflorescencias'];
-                              final tieneFoto = punto['foto_path'] != null;
-                              final numero = punto['numero_registro'] as int?;
-                              return Marker(
-                                point: LatLng(latitud, longitud),
-                                width: 32,
-                                height: 32,
-                                child: Tooltip(
-                                  message: [
-                                    'Punto de registro',
-                                    if (verdes != null) 'Verdes: $verdes',
-                                    if (pintones != null) 'Pintones: $pintones',
-                                    if (inflorescencias != null)
-                                      'Inflorescencias: $inflorescencias',
-                                    if (tieneFoto) 'Con evidencia fotográfica',
-                                  ].join('\n'),
-                                  child: Container(
-                                    width: 28,
-                                    height: 28,
-                                    decoration: BoxDecoration(
-                                      color: tieneFoto
-                                          ? Colors.orangeAccent
-                                          : Colors.deepOrange,
-                                      border: Border.all(
-                                        color: Colors.white,
-                                        width: 2,
-                                      ),
-                                      borderRadius: BorderRadius.circular(14),
-                                      boxShadow: const [
-                                        BoxShadow(
-                                          color: Colors.black26,
-                                          blurRadius: 4,
-                                          offset: Offset(0, 2),
-                                        ),
-                                      ],
-                                    ),
-                                    alignment: Alignment.center,
-                                    child: Text(
-                                      numero != null ? '$numero' : '',
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 10,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              );
-                            }).toList(),
-                          ),
-                          RichAttributionWidget(
-                            attributions: [
-                              TextSourceAttribution(
-                                'Source: Esri, Vantor, Earthstar Geographics, '
-                                'and the GIS User Community. City names: Esri '
-                                'World Cities data.',
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
+                Positioned.fill(
+                  child: FlutterMap(
+                    mapController: _mapController,
+                    options: MapOptions(
+                      initialCenter: LatLng(4.7110, -74.0721),
+                      initialZoom: 6,
+                      maxZoom: 24,
+                      backgroundColor: const Color(0xFF53624F),
+                      onMapReady: () =>
+                          _programarCargaCiudades(_mapController.camera),
+                      onPositionChanged: _actualizarVistaMapa,
+                      onTap: _seleccionarCoordenada,
                     ),
-                    if (_recorridos.isNotEmpty)
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            children: _recorridos.map((recorridoItem) {
-                              final seleccionado =
-                                  _actual?.id == recorridoItem.id;
-                              return Padding(
-                                padding: const EdgeInsets.only(right: 8),
-                                child: ChoiceChip(
-                                  avatar: Icon(
-                                    _iconoEstadoRecorrido(recorridoItem.estado),
-                                    size: 18,
-                                    color: _colorEstadoRecorrido(
-                                      recorridoItem.estado,
-                                    ),
-                                  ),
-                                  label: Text(
-                                    recorridoItem.nombre.isNotEmpty
-                                        ? recorridoItem.nombre
-                                        : 'Recorrido ${recorridoItem.id}',
-                                  ),
-                                  selected: seleccionado,
-                                  selectedColor: _colorEstadoRecorrido(
-                                    recorridoItem.estado,
-                                  ).withValues(alpha: 0.18),
-                                  onSelected: (_) {
-                                    if (!seleccionado) {
-                                      _mostrarRecorrido(recorridoItem);
-                                    }
-                                  },
-                                  showCheckmark: false,
-                                ),
-                              );
-                            }).toList(),
-                          ),
-                        ),
+                    children: [
+                      TileLayer(
+                        urlTemplate: '${OfflineTileStore.url}/{z}/{y}/{x}',
+                        userAgentPackageName: 'com.example.coordenadas_app',
+                        maxNativeZoom: 23,
+                        tileProvider: EsriImageryTileProvider(),
                       ),
-                    _IndicadorVistaMapa(zoom: _zoomMapa, latitud: _latitudMapa),
-                    _IndicadorBrujula(
-                      rumbo: _rumbo ?? _ultimaPosicion?.heading,
-                    ),
-                    if (recorrido != null)
-                      Card(
-                        margin: const EdgeInsets.all(12),
-                        child: Padding(
-                          padding: const EdgeInsets.all(12),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Text(
-                                recorrido.nombre,
-                                style: Theme.of(context).textTheme.titleLarge,
+                      MarkerLayer(
+                        markers: _ciudades.map(_marcadorCiudad).toList(),
+                      ),
+                      if (_ruta.length >= 2)
+                        PolylineLayer(
+                          polylines: [
+                            Polyline(
+                              points: _ruta,
+                              color: Colors.blue,
+                              strokeWidth: 5,
+                            ),
+                          ],
+                        ),
+                      if (_ultimaPosicion != null)
+                        MarkerLayer(
+                          markers: [
+                            Marker(
+                              point: LatLng(
+                                _ultimaPosicion!.latitude,
+                                _ultimaPosicion!.longitude,
                               ),
-                              Row(
-                                children: [
-                                  Icon(
-                                    _iconoEstadoRecorrido(recorrido.estado),
-                                    size: 18,
-                                    color: _colorEstadoRecorrido(
-                                      recorrido.estado,
-                                    ),
+                              width: 64,
+                              height: 64,
+                              child: _MarcadorUbicacion(
+                                rumbo: _rumbo ?? _ultimaPosicion!.heading,
+                                precision: _ultimaPosicion!.accuracy,
+                              ),
+                            ),
+                          ],
+                        ),
+                      if (_coordenadaSeleccionada != null)
+                        MarkerLayer(
+                          markers: [
+                            Marker(
+                              point: _coordenadaSeleccionada!,
+                              width: 42,
+                              height: 42,
+                              child: const Icon(
+                                Icons.add_location_alt,
+                                color: Colors.red,
+                                size: 36,
+                              ),
+                            ),
+                          ],
+                        ),
+                      if (_coordenadaSeleccionada != null)
+                        MarkerLayer(
+                          markers: [
+                            Marker(
+                              point: _coordenadaSeleccionada!,
+                              width: 42,
+                              height: 42,
+                              child: const Icon(
+                                Icons.add_location_alt,
+                                color: Colors.red,
+                                size: 36,
+                              ),
+                            ),
+                          ],
+                        ),
+                      MarkerLayer(
+                        markers: _puntosMuestreo.map((punto) {
+                          final latitud = (punto['latitud']! as num).toDouble();
+                          final longitud = (punto['longitud']! as num)
+                              .toDouble();
+                          final verdes = punto['racimos_verdes'];
+                          final pintones = punto['racimos_pintones'];
+                          final inflorescencias = punto['inflorescencias'];
+                          final tieneFoto = punto['foto_path'] != null;
+                          final numero = punto['numero_registro'] as int?;
+                          return Marker(
+                            point: LatLng(latitud, longitud),
+                            width: 32,
+                            height: 32,
+                            child: Tooltip(
+                              message: [
+                                'Punto de registro',
+                                if (verdes != null) 'Verdes: $verdes',
+                                if (pintones != null) 'Pintones: $pintones',
+                                if (inflorescencias != null)
+                                  'Inflorescencias: $inflorescencias',
+                                if (tieneFoto) 'Con evidencia fotográfica',
+                              ].join('\n'),
+                              child: Container(
+                                width: 28,
+                                height: 28,
+                                decoration: BoxDecoration(
+                                  color: tieneFoto
+                                      ? Colors.orangeAccent
+                                      : Colors.deepOrange,
+                                  border: Border.all(
+                                    color: Colors.white,
+                                    width: 2,
                                   ),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    'Estado: ${_estadoTexto(recorrido.estado)}',
-                                    style: TextStyle(
-                                      color: _colorEstadoRecorrido(
-                                        recorrido.estado,
-                                      ),
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              if (recorrido.estado ==
-                                      EstadoRecorrido.finalizado &&
-                                  recorrido.fin != null)
-                                Text(
-                                  'Finalizado: ${recorrido.fin!.toLocal().toString().substring(0, 16)}',
-                                  style: Theme.of(context).textTheme.bodySmall,
-                                ),
-                              Text('Puntos registrados: ${_ruta.length}'),
-                              Text(
-                                'Registros de plantación: $_registrosMuestreo',
-                              ),
-                              const SizedBox(height: 8),
-                              if (recorrido.estado == EstadoRecorrido.activo ||
-                                  recorrido.estado ==
-                                      EstadoRecorrido.pausado) ...[
-                                const Text(
-                                  'Acciones del recorrido',
-                                  style: TextStyle(fontWeight: FontWeight.bold),
-                                ),
-                                Wrap(
-                                  spacing: 8,
-                                  runSpacing: 8,
-                                  children: [
-                                    if (recorrido.estado ==
-                                        EstadoRecorrido.activo)
-                                      FilledButton.icon(
-                                        onPressed: _registrandoMuestreo
-                                            ? null
-                                            : _registrarMuestreo,
-                                        icon: const Icon(Icons.forest),
-                                        label: const Text('Registrar punto'),
-                                      ),
-                                    if (recorrido.estado ==
-                                        EstadoRecorrido.activo)
-                                      FilledButton.icon(
-                                        onPressed: _pausar,
-                                        icon: const Icon(Icons.pause),
-                                        label: const Text('Pausar'),
-                                      ),
-                                    if (recorrido.estado ==
-                                        EstadoRecorrido.pausado)
-                                      FilledButton.icon(
-                                        onPressed: _reanudar,
-                                        icon: const Icon(Icons.play_arrow),
-                                        label: const Text('Reanudar'),
-                                      ),
-                                    OutlinedButton.icon(
-                                      onPressed: _finalizar,
-                                      icon: const Icon(Icons.stop),
-                                      label: const Text('Finalizar'),
+                                  borderRadius: BorderRadius.circular(14),
+                                  boxShadow: const [
+                                    BoxShadow(
+                                      color: Colors.black26,
+                                      blurRadius: 4,
+                                      offset: Offset(0, 2),
                                     ),
                                   ],
                                 ),
-                              ] else if (recorrido.estado ==
-                                  EstadoRecorrido.finalizado)
-                                const Text(
-                                  'Recorrido finalizado · vista de consulta',
-                                  style: TextStyle(color: Colors.blueGrey),
+                                alignment: Alignment.center,
+                                child: Text(
+                                  numero != null ? '$numero' : '',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                  ),
                                 ),
-                              const Divider(),
-                              const Text(
-                                'Exportar',
-                                style: TextStyle(fontWeight: FontWeight.bold),
                               ),
-                              const SizedBox(height: 8),
-                              Wrap(
-                                spacing: 8,
-                                runSpacing: 8,
-                                children: [
-                                  OutlinedButton.icon(
-                                    onPressed: () => _exportarRecorrido(
-                                      () =>
-                                          ExportadorDatos.compartirRecorridoExcel(
-                                            recorrido.id,
-                                          ),
-                                      'el Excel de registros',
-                                    ),
-                                    icon: const Icon(Icons.table_view),
-                                    label: const Text('Registros Excel'),
-                                  ),
-                                  OutlinedButton.icon(
-                                    onPressed: () => _exportarRecorrido(
-                                      () =>
-                                          ExportadorDatos.compartirRecorridoKml(
-                                            recorrido.id,
-                                          ),
-                                      'el KML del recorrido',
-                                    ),
-                                    icon: const Icon(Icons.public),
-                                    label: const Text('Ruta y registros KML'),
-                                  ),
-                                ],
-                              ),
-                            ],
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                      RichAttributionWidget(
+                        attributions: [
+                          TextSourceAttribution(
+                            'Source: Esri, Vantor, Earthstar Geographics, '
+                            'and the GIS User Community. City names: Esri '
+                            'World Cities data.',
                           ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                Positioned(
+                  top: 4,
+                  left: 4,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _IndicadorVistaMapa(
+                        zoom: _zoomMapa,
+                        latitud: _latitudMapa,
+                        factorAlturaMapa: 0.9,
+                      ),
+                      _IndicadorBrujula(
+                        rumbo: _rumbo ?? _ultimaPosicion?.heading,
+                      ),
+                    ],
+                  ),
+                ),
+                DraggableScrollableSheet(
+                  initialChildSize: 0.34,
+                  minChildSize: 0.12,
+                  maxChildSize: 0.86,
+                  snap: true,
+                  snapSizes: const [0.34],
+                  builder: (context, scrollController) => Container(
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surface,
+                      borderRadius: const BorderRadius.vertical(
+                        top: Radius.circular(20),
+                      ),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Colors.black26,
+                          blurRadius: 12,
+                          offset: Offset(0, -3),
                         ),
-                      )
-                    else
-                      Padding(
-                        padding: const EdgeInsets.all(20),
-                        child: FilledButton.icon(
-                          onPressed: _iniciandoRecorrido
-                              ? null
-                              : _iniciarRecorrido,
-                          icon: const Icon(Icons.route),
-                          label: const Text('Iniciar recorrido'),
+                      ],
+                    ),
+                    child: SafeArea(
+                      top: false,
+                      child: SingleChildScrollView(
+                        controller: scrollController,
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Center(
+                              child: Container(
+                                width: 36,
+                                height: 4,
+                                decoration: BoxDecoration(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant
+                                      .withValues(alpha: 0.4),
+                                  borderRadius: BorderRadius.circular(2),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              'Recorrido y registros',
+                              style: Theme.of(context).textTheme.titleMedium,
+                            ),
+                            if (_recorridos.isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
+                                  child: Row(
+                                    children: _recorridos.map((recorridoItem) {
+                                      final seleccionado =
+                                          _actual?.id == recorridoItem.id;
+                                      return Padding(
+                                        padding: const EdgeInsets.only(
+                                          right: 8,
+                                        ),
+                                        child: ChoiceChip(
+                                          avatar: Icon(
+                                            _iconoEstadoRecorrido(
+                                              recorridoItem.estado,
+                                            ),
+                                            size: 18,
+                                            color: _colorEstadoRecorrido(
+                                              recorridoItem.estado,
+                                            ),
+                                          ),
+                                          label: Text(
+                                            recorridoItem.nombre.isNotEmpty
+                                                ? recorridoItem.nombre
+                                                : 'Recorrido ${recorridoItem.id}',
+                                          ),
+                                          selected: seleccionado,
+                                          selectedColor: _colorEstadoRecorrido(
+                                            recorridoItem.estado,
+                                          ).withValues(alpha: 0.18),
+                                          onSelected: (_) {
+                                            if (!seleccionado) {
+                                              _mostrarRecorrido(recorridoItem);
+                                            }
+                                          },
+                                          showCheckmark: false,
+                                        ),
+                                      );
+                                    }).toList(),
+                                  ),
+                                ),
+                              ),
+                            if (recorrido != null)
+                              Card(
+                                margin: const EdgeInsets.only(top: 8),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.stretch,
+                                    children: [
+                                      Text(
+                                        recorrido.nombre,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .titleLarge,
+                                      ),
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            _iconoEstadoRecorrido(
+                                              recorrido.estado,
+                                            ),
+                                            size: 18,
+                                            color: _colorEstadoRecorrido(
+                                              recorrido.estado,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                          Text(
+                                            'Estado: ${_estadoTexto(recorrido.estado)}',
+                                            style: TextStyle(
+                                              color: _colorEstadoRecorrido(
+                                                recorrido.estado,
+                                              ),
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      if (recorrido.estado ==
+                                              EstadoRecorrido.finalizado &&
+                                          recorrido.fin != null)
+                                        Text(
+                                          'Finalizado: ${recorrido.fin!.toLocal().toString().substring(0, 16)}',
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .bodySmall,
+                                        ),
+                                      Text(
+                                        'Puntos registrados: ${_ruta.length}',
+                                      ),
+                                      Text(
+                                        'Registros de plantación: $_registrosMuestreo',
+                                      ),
+                                      const SizedBox(height: 8),
+                                      if (recorrido.estado ==
+                                              EstadoRecorrido.activo ||
+                                          recorrido.estado ==
+                                              EstadoRecorrido.pausado) ...[
+                                        const Text(
+                                          'Acciones del recorrido',
+                                          style: TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                        Wrap(
+                                          spacing: 8,
+                                          runSpacing: 8,
+                                          children: [
+                                            if (recorrido.estado ==
+                                                EstadoRecorrido.activo)
+                                              FilledButton.icon(
+                                                onPressed: _registrandoMuestreo
+                                                    ? null
+                                                    : _registrarMuestreo,
+                                                icon: const Icon(Icons.forest),
+                                                label: const Text(
+                                                  'Registrar punto',
+                                                ),
+                                              ),
+                                            if (recorrido.estado ==
+                                                EstadoRecorrido.activo)
+                                              FilledButton.icon(
+                                                onPressed: _pausar,
+                                                icon: const Icon(Icons.pause),
+                                                label: const Text('Pausar'),
+                                              ),
+                                            if (recorrido.estado ==
+                                                EstadoRecorrido.pausado)
+                                              FilledButton.icon(
+                                                onPressed: _reanudar,
+                                                icon: const Icon(
+                                                  Icons.play_arrow,
+                                                ),
+                                                label: const Text('Reanudar'),
+                                              ),
+                                            OutlinedButton.icon(
+                                              onPressed: _finalizar,
+                                              icon: const Icon(Icons.stop),
+                                              label: const Text('Finalizar'),
+                                            ),
+                                          ],
+                                        ),
+                                      ] else if (recorrido.estado ==
+                                          EstadoRecorrido.finalizado)
+                                        const Text(
+                                          'Recorrido finalizado · vista de consulta',
+                                          style: TextStyle(
+                                            color: Colors.blueGrey,
+                                          ),
+                                        ),
+                                      const Divider(),
+                                      const Text(
+                                        'Exportar',
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Wrap(
+                                        spacing: 8,
+                                        runSpacing: 8,
+                                        children: [
+                                          OutlinedButton.icon(
+                                            onPressed: () => _exportarRecorrido(
+                                              () =>
+                                                  ExportadorDatos.compartirRecorridoExcel(
+                                                    recorrido.id,
+                                                  ),
+                                              'el Excel de registros',
+                                            ),
+                                            icon: const Icon(Icons.table_view),
+                                            label: const Text(
+                                              'Registros Excel',
+                                            ),
+                                          ),
+                                          OutlinedButton.icon(
+                                            onPressed: () => _exportarRecorrido(
+                                              () =>
+                                                  ExportadorDatos.compartirRecorridoKml(
+                                                    recorrido.id,
+                                                  ),
+                                              'el KML del recorrido',
+                                            ),
+                                            icon: const Icon(Icons.public),
+                                            label: const Text(
+                                              'Ruta y registros KML',
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              )
+                            else
+                              Padding(
+                                padding: const EdgeInsets.all(20),
+                                child: FilledButton.icon(
+                                  onPressed: _iniciandoRecorrido
+                                      ? null
+                                      : _iniciarRecorrido,
+                                  icon: const Icon(Icons.route),
+                                  label: const Text('Iniciar recorrido'),
+                                ),
+                              ),
+                          ],
                         ),
                       ),
-                  ],
+                    ),
+                  ),
                 ),
                 if (_iniciandoRecorrido || _registrandoMuestreo)
                   const _CargandoOperacion(mensaje: 'Guardando información...'),
